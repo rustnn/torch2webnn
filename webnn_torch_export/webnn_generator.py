@@ -47,7 +47,7 @@ def throw_unsupported(type, node, module_type="", module_class=""):
     raise NotImplementedError(error_msg)
 
 
-IGNORED_PLACEHOLDER_TOKENS = {'modules', 'buffers', 'parameters'}
+IGNORED_PLACEHOLDER_TOKENS = {'modules', 'buffers', 'parameters', 'self'}
 
 
 class WebNNGraphGenerator:
@@ -158,7 +158,7 @@ class WebNNGraphGenerator:
             dtype = self._get_webnn_dtype(tensor.dtype)
             shape_str = ', '.join(map(str, shape))
 
-            consts.append(f'    {operand_name}: {dtype}[{shape_str}] @weights("{name}");')
+            consts.append(f'\t{operand_name}: {dtype}[{shape_str}] @weights("{name}");')
             weight_map[name] = operand_name
             self.weight_operands[name] = operand_name
             self.operand_shapes[operand_name] = shape
@@ -170,18 +170,23 @@ class WebNNGraphGenerator:
         operations = []
 
         for i, node in enumerate(gm.graph.nodes):
-            if node.op == 'call_function':
-                op_str = self._map_pytorch_to_webnn_op(node)
-                if op_str:
-                    operations.append(f'    {op_str}')
-            elif node.op == 'call_module':
-                op_str = self._map_module_to_webnn_op(node, gm)
-                if op_str:
-                    operations.append(f'    {op_str}')
-            elif node.op == 'call_method':
-                op_str = self._map_method_to_webnn_op(node)
-                if op_str:
-                    operations.append(f'    {op_str}')
+            try:
+                if node.op == 'call_function':
+                    op_str = self._map_pytorch_to_webnn_op(node)
+                    if op_str:
+                        operations.append(f'\t{op_str}')
+                elif node.op == 'call_module':
+                    op_str = self._map_module_to_webnn_op(node, gm)
+                    if op_str:
+                        operations.append(f'\t{op_str}')
+                elif node.op == 'call_method':
+                    op_str = self._map_method_to_webnn_op(node)
+                    if op_str:
+                        operations.append(f'\t{op_str}')
+            except NotImplementedError as e:
+                input_operands = [self._get_input_operand(arg) for arg in node.args if isinstance(arg, fx.Node)]
+                inputs_str = ', '.join(input_operands)
+                operations.append(f'\t// invalid: {node.op} {node.target} inputs=[{inputs_str}] args={list(node.args)}')
 
         return '\n'.join(operations) + '\n' if operations else ''
 
@@ -197,11 +202,6 @@ class WebNNGraphGenerator:
         if converter:
             return converter(self, node, output_operand, input_operands)
 
-        # Raise error for unsupported operations
-        target_str = str(node.target)
-        target_name = getattr(node.target, "__name__", target_str)
-        schema = getattr(node.target, "_schema", None)
-        schema_str = str(schema) if schema else "N/A"
         throw_unsupported("Operation", node)
 
     def _map_method_to_webnn_op(self, node: fx.Node) -> str:
@@ -216,11 +216,6 @@ class WebNNGraphGenerator:
         if converter:
             return converter(self, node, output_operand, input_operands)
 
-        # Raise error for unsupported operations
-        target_str = str(node.target)
-        target_name = getattr(node.target, "__name__", target_str)
-        schema = getattr(node.target, "_schema", None)
-        schema_str = str(schema) if schema else "N/A"
         throw_unsupported("Method", node)
 
     def _map_module_to_webnn_op(self, node: fx.Node, gm: fx.GraphModule) -> str:
@@ -277,8 +272,8 @@ class WebNNGraphGenerator:
             self.operand_counter += 1
             return (
                 f'[{reshaped_bias}] = reshape({bias_operand}, newShape=[1, {c}, 1, 1]);\n'
-                f'    [{conv_out}] = conv2d({input_tensor}, {weight}, {params_str});\n'
-                f'    [{output}] = add({conv_out}, {reshaped_bias});'
+                f'\t[{conv_out}] = conv2d({input_tensor}, {weight}, {params_str});\n'
+                f'\t[{output}] = add({conv_out}, {reshaped_bias});'
             )
         return f'[{output}] = conv2d({input_tensor}, {weight}, {params_str});'
 
@@ -330,7 +325,7 @@ class WebNNGraphGenerator:
                 # Create an inline constant for the numeric value
                 const_operand = self._create_inline_constant(node.args[0])
                 return f'[{output}] = {op}({inputs[0]}, {const_operand});'
-        return f'// Invalid {op} operation'
+        raise NotImplementedError(f'Invalid {op} operation')
 
     def _convert_math(self, node: fx.Node, output: str, inputs: List[str], op: str) -> str:
         """Convert math functions (sqrt, exp, log, cos, sin) to WebNN"""
@@ -341,30 +336,36 @@ class WebNNGraphGenerator:
         """Convert power to WebNN pow"""
         if len(inputs) >= 2:
             return f'[{output}] = pow({inputs[0]}, {inputs[1]});'
-        return f'// Invalid pow operation'
+        raise NotImplementedError('Invalid pow operation')
 
     def _convert_neg(self, node: fx.Node, output: str, inputs: List[str]) -> str:
         """Convert negation to WebNN neg"""
         input_tensor = inputs[0] if inputs else 'unknown'
         return f'[{output}] = neg({input_tensor});'
 
-    def _convert_cast(self, node: fx.Node, output: str, inputs: List[str]) -> str:
+    def _convert_cast(self, node: fx.Node, output: str, inputs: List[str], dtype=None) -> str:
         """Convert type casting (tensor.to) to WebNN cast"""
         input_tensor = inputs[0] if inputs else 'unknown'
 
         # Get target dtype from args
         # to(dtype) or to(device, dtype) or to(tensor, dtype, ...)
         target_dtype = None
-        for arg in node.args[1:]:  # Skip first arg (input tensor)
-            if isinstance(arg, torch.dtype):
-                target_dtype = arg
-                break
-
+        if dtype is not None:
+            # this path represents tensor.float() or similar
+            target_dtype = dtype
+        else:
+            for arg in node.args[1:]:  # Skip first arg (input tensor)
+                if isinstance(arg, torch.dtype):
+                    target_dtype = arg
+                    break
         # Also check kwargs
         if target_dtype is None and 'dtype' in node.kwargs:
             target_dtype = node.kwargs['dtype']
 
         # If no dtype found, just return identity (might be device-only cast)
+        # TODO ignore casts for now since there are some issues in ORT execution:
+        # RuntimeError: ONNX execution failed: onnx runtime failed: load model failed: This is an invalid model. In Node, ("cast_131", Cast, "", -1) : ("operand_389": tensor(float),) -> ("operand_390",) , Error Required attribute 'to' is missing.
+        return f'[{output}] = identity({input_tensor});'
         if target_dtype is None:
             return f'[{output}] = identity({input_tensor});'
 
@@ -412,6 +413,82 @@ class WebNNGraphGenerator:
         step2 = f'[{output}] = mul({input_tensor}, {sigmoid_operand});'
 
         return f'{step1}\n    {step2}'
+
+    def _convert_batch_norm(self, node: fx.Node, output: str, inputs: List[str]) -> str:
+        """Convert batch_norm to WebNN.
+
+        Dynamo always emits the same target for both cases:
+          batch_norm(input, running_mean, running_var, weight, bias, training, momentum, eps, ...)
+        When track_running_stats=False the running_mean/var args are None (not FX Nodes).
+
+        With running stats  → batchNormalization(input, mean, var, axis=1, scale, bias, eps).
+        Without running stats → decompose over NCHW axes [0, 2, 3].
+        """
+        args = node.args
+
+        def get_op(idx):
+            n = args[idx] if len(args) > idx else None
+            return self._get_input_operand(n) if isinstance(n, fx.Node) else None
+
+        input_tensor = get_op(0) or 'unknown'
+        mean_op  = get_op(1)   # running_mean or None
+        var_op   = get_op(2)   # running_var  or None
+        weight   = get_op(3)   # gamma
+        bias     = get_op(4)   # beta
+        eps      = args[7] if len(args) > 7 else 1e-5
+
+        if mean_op and var_op:
+            # Eval with running stats — use WebNN batchNormalization
+            params = [f'epsilon={eps}', 'axis=1']
+            if weight:
+                params.append(f'scale={weight}')
+            if bias:
+                params.append(f'bias={bias}')
+            return f'[{output}] = batchNormalization({input_tensor}, {mean_op}, {var_op}, {", ".join(params)});'
+
+        # No running stats — decompose for NCHW (normalize over axes [0, 2, 3])
+        input_shape = self._get_node_shape(args[0]) if args and isinstance(args[0], fx.Node) else []
+        C = input_shape[1] if len(input_shape) > 1 else 0
+        eps_c = self._create_inline_constant(float(eps))
+
+        mean_t   = f'operand_{self.operand_counter}'; self.operand_counter += 1
+        centered = f'operand_{self.operand_counter}'; self.operand_counter += 1
+        sq       = f'operand_{self.operand_counter}'; self.operand_counter += 1
+        var_t    = f'operand_{self.operand_counter}'; self.operand_counter += 1
+        var_eps  = f'operand_{self.operand_counter}'; self.operand_counter += 1
+        std_t    = f'operand_{self.operand_counter}'; self.operand_counter += 1
+        norm_t   = f'operand_{self.operand_counter}'; self.operand_counter += 1
+
+        steps = [
+            f'[{mean_t}] = reduceMean({input_tensor}, axes=[0, 2, 3], keepDimensions=true);',
+            f'[{centered}] = sub({input_tensor}, {mean_t});',
+            f'[{sq}] = mul({centered}, {centered});',
+            f'[{var_t}] = reduceMean({sq}, axes=[0, 2, 3], keepDimensions=true);',
+            f'[{var_eps}] = add({var_t}, {eps_c});',
+            f'[{std_t}] = sqrt({var_eps});',
+            f'[{norm_t}] = div({centered}, {std_t});',
+        ]
+        result = norm_t
+
+        if weight and C:
+            w_shaped = f'operand_{self.operand_counter}'; self.operand_counter += 1
+            scaled   = f'operand_{self.operand_counter}'; self.operand_counter += 1
+            steps += [
+                f'[{w_shaped}] = reshape({weight}, newShape=[1, {C}, 1, 1]);',
+                f'[{scaled}] = mul({result}, {w_shaped});',
+            ]
+            result = scaled
+
+        if bias and C:
+            b_shaped = f'operand_{self.operand_counter}'; self.operand_counter += 1
+            steps += [
+                f'[{b_shaped}] = reshape({bias}, newShape=[1, {C}, 1, 1]);',
+                f'[{output}] = add({result}, {b_shaped});',
+            ]
+        else:
+            steps.append(f'[{output}] = identity({result});')
+
+        return '\n\t'.join(steps)
 
     def _convert_layer_norm(self, node: fx.Node, output: str, inputs: List[str]) -> str:
         """Convert layer normalization to WebNN layerNormalization"""
@@ -545,20 +622,34 @@ class WebNNGraphGenerator:
         steps = [step1, step2, step3, step4a, step4b, step5a, step5b, step6, step7]
 
         if weight:
+            reshaped_weight = f'operand_{self.operand_counter}'
+            self.operand_counter += 1
+            weight_shape = [1] * len(input_shape)
+            weight_shape[1] = self.operand_shapes[weight][0]
+            weight_shape_str = ', '.join(map(str, weight_shape))
+            step8a = f'[{reshaped_weight}] = reshape({weight}, newShape=[{weight_shape_str}]);'
+            steps.append(step8a)
             scaled = f'operand_{self.operand_counter}'
             self.operand_counter += 1
-            step8 = f'[{scaled}] = mul({result}, {weight});'
-            steps.append(step8)
+            step8b = f'[{scaled}] = mul({result}, {reshaped_weight});'
+            steps.append(step8b)
             result = scaled
 
         if bias:
-            step9 = f'[{output}] = add({result}, {bias});'
-            steps.append(step9)
+            reshaped_bias = f'operand_{self.operand_counter}'
+            self.operand_counter += 1
+            bias_shape = [1] * len(input_shape)
+            bias_shape[1] = self.operand_shapes[bias][0]
+            bias_shape_str = ', '.join(map(str, bias_shape))
+            step9a = f'[{reshaped_bias}] = reshape({bias}, newShape=[{bias_shape_str}]);'
+            steps.append(step9a)
+            step9b = f'[{output}] = add({result}, {reshaped_bias});'
+            steps.append(step9b)
         else:
             # Rename final result to output
             steps.append(f'[{output}] = identity({result});')
 
-        return '\n    '.join(steps)
+        return '\n\t'.join(steps)
 
     def _convert_getitem(self, node: fx.Node, output: str, inputs: List[str]) -> str:
         """
@@ -652,7 +743,7 @@ class WebNNGraphGenerator:
                 if all(isinstance(idx, int) for idx in index):
                     # All integer indices - results in a scalar or lower-rank tensor
                     # This requires gather operation which we may not have yet
-                    return f'// TODO: getitem with all integer indices (gather operation needed)'
+                    raise NotImplementedError("getitem with all integer indices (gather operation needed)")
 
                 # Mixed slice and integer indexing
                 # Build starts, sizes, and output shape
@@ -671,7 +762,7 @@ class WebNNGraphGenerator:
                         step = idx.step if idx.step is not None else 1
 
                         if step != 1:
-                            return f'// TODO: getitem with step != 1 not supported yet'
+                            raise NotImplementedError("getitem with step != 1 not supported yet")
 
                         starts.append(start)
                         size = stop - start
@@ -740,7 +831,7 @@ class WebNNGraphGenerator:
             step = index.step if index.step is not None else 1
 
             if step != 1:
-                return f'// TODO: getitem with step != 1 not supported yet'
+                raise NotImplementedError("getitem with step != 1 not supported yet")
 
             # Build full starts and sizes for all dimensions
             starts = [start] + [0] * (len(input_shape) - 1)
@@ -752,16 +843,143 @@ class WebNNGraphGenerator:
             return f'[{output}] = slice({input_tensor}, starts=[{starts_str}], sizes=[{sizes_str}]);'
 
         # Unknown index type
-        return f'// TODO: getitem with index type {type(index).__name__} not supported yet'
+        raise NotImplementedError(f"getitem with index type {type(index).__name__} not supported yet")
 
     def _convert_rearrange(self, node: fx.Node, output: str, inputs: List[str]) -> str:
         """
-        Convert einops rearrange to WebNN operations.
+        Convert einops rearrange to WebNN reshape/transpose operations.
 
-        Rearrange is a powerful operation from einops that can express many transformations.
-        This implementation handles common patterns used in vision models.
+        Algorithm:
+          1. Parse both sides of the '->' pattern into groups of elementary axes.
+          2. Resolve each elementary axis size from kwargs, then lhs→input_shape,
+             then rhs→output_shape.
+          3. Build the permutation that maps lhs elementary-axis order to rhs order.
+          4. Emit up to three ops (skipping no-ops):
+               reshape  (expand merged input axes)
+               transpose (reorder axes)
+               reshape  (collapse merged output axes)
         """
-        raise NotImplementedError("Rearrange is not yet implemented.")
+        input_tensor = inputs[0] if inputs else 'unknown'
+
+        if not isinstance(node.args[1], str):
+            raise NotImplementedError("Rearrange only supports string patterns")
+
+        pattern = node.args[1]
+        # kwargs carry axis sizes like pi=2, pj=2
+        kwargs = {k: int(v) for k, v in node.kwargs.items() if isinstance(v, int)}
+
+        input_shape = self._get_node_shape(node.args[0])
+        output_shape = self._get_node_shape(node)
+
+        if not input_shape or not output_shape:
+            raise NotImplementedError(
+                f"Rearrange requires static shapes, got input={input_shape}, output={output_shape}"
+            )
+
+        lhs_str, rhs_str = pattern.split('->')
+
+        def parse_side(s: str):
+            """Return a list of groups; each group is a list of axis name strings."""
+            groups = []
+            s = s.strip()
+            i = 0
+            while i < len(s):
+                if s[i] == '(':
+                    j = s.index(')', i)
+                    inner = s[i + 1:j].strip().split()
+                    groups.append(inner)
+                    i = j + 1
+                elif s[i] == ' ':
+                    i += 1
+                else:
+                    j = i
+                    while j < len(s) and s[j] not in (' ', '(', ')'):
+                        j += 1
+                    token = s[i:j]
+                    if token:
+                        groups.append([token])
+                    i = j
+            return groups
+
+        lhs_groups = parse_side(lhs_str)
+        rhs_groups = parse_side(rhs_str)
+
+        lhs_axes = [ax for group in lhs_groups for ax in group]
+        rhs_axes = [ax for group in rhs_groups for ax in group]
+
+        # Resolve axis sizes -----------------------------------------------
+        # Any axis name that is a plain integer string is a literal size.
+        def is_literal(ax: str) -> bool:
+            return ax.lstrip('-').isdigit()
+
+        axis_sizes = {ax: int(ax) for ax in lhs_axes + rhs_axes if is_literal(ax)}
+        axis_sizes.update(kwargs)
+
+        for group, dim_size in zip(lhs_groups, input_shape):
+            if len(group) == 1:
+                axis_sizes[group[0]] = dim_size
+            else:
+                known = math.prod(axis_sizes[ax] for ax in group if ax in axis_sizes)
+                unknown = [ax for ax in group if ax not in axis_sizes]
+                if len(unknown) == 1:
+                    axis_sizes[unknown[0]] = dim_size // known
+
+        for group, dim_size in zip(rhs_groups, output_shape):
+            if len(group) == 1:
+                axis_sizes.setdefault(group[0], dim_size)
+            else:
+                known = math.prod(axis_sizes.get(ax, 1) for ax in group if ax in axis_sizes)
+                unknown = [ax for ax in group if ax not in axis_sizes]
+                if len(unknown) == 1:
+                    axis_sizes[unknown[0]] = dim_size // known
+
+        # Expanded (flat) shapes -------------------------------------------
+        expanded_input_shape = [axis_sizes[ax] for ax in lhs_axes]
+
+        # Permutation is built only over rhs axes that come from lhs.
+        # Axes in rhs but not in lhs (e.g. literal '1' insertions) are
+        # excluded here; the final reshape-to-output_shape inserts them.
+        lhs_axis_idx = {ax: i for i, ax in enumerate(lhs_axes)}
+        rhs_real_axes = [ax for ax in rhs_axes if ax in lhs_axis_idx and not is_literal(ax)]
+        permutation = [lhs_axis_idx[ax] for ax in rhs_real_axes]
+
+        needs_expand = expanded_input_shape != list(input_shape)
+        needs_transpose = permutation != list(range(len(permutation)))
+        # Shape after expand + transpose — may differ from output_shape when
+        # literal '1' dimensions are inserted or merged groups are collapsed.
+        post_transpose_shape = [axis_sizes[ax] for ax in rhs_real_axes]
+        needs_collapse = post_transpose_shape != list(output_shape)
+
+        if not needs_expand and not needs_transpose and not needs_collapse:
+            return f'[{output}] = identity({input_tensor});'
+
+        # Build op sequence ------------------------------------------------
+        ops = []
+        if needs_expand:
+            ops.append(('reshape', expanded_input_shape))
+        if needs_transpose:
+            ops.append(('transpose', permutation))
+        if needs_collapse:
+            ops.append(('reshape', output_shape))
+
+        steps = []
+        current = input_tensor
+        for idx, (op_type, param) in enumerate(ops):
+            is_last = (idx == len(ops) - 1)
+            out_name = output if is_last else f'operand_{self.operand_counter}'
+            if not is_last:
+                self.operand_counter += 1
+
+            if op_type == 'reshape':
+                shape_str = ', '.join(map(str, param))
+                steps.append(f'[{out_name}] = reshape({current}, newShape=[{shape_str}]);')
+            else:  # transpose
+                perm_str = ', '.join(map(str, param))
+                steps.append(f'[{out_name}] = transpose({current}, permutation=[{perm_str}]);')
+
+            current = out_name
+
+        return '\n    '.join(steps)
 
     def _convert_arange(self, node: fx.Node, output: str, inputs: List[str]) -> str:
         """
@@ -819,11 +1037,11 @@ class WebNNGraphGenerator:
         # einsum(pattern, *tensors)
         args = node.args
         if not args:
-            return f'// Invalid einsum: no arguments'
+            raise NotImplementedError('Invalid einsum: no arguments')
 
         pattern = args[0] if isinstance(args[0], str) else None
         if not pattern:
-            return f'// Invalid einsum: pattern not found'
+            raise NotImplementedError('Invalid einsum: pattern not found')
 
         # Get input shapes
         input_shapes = []
@@ -926,7 +1144,7 @@ class WebNNGraphGenerator:
         # Pattern: 'ii->i' (diagonal extraction)
         elif len(input_patterns) == 1 and len(input_patterns[0]) == 2 and len(rhs) == 1:
             # Diagonal extraction - not directly supported, would need gather
-            return f'// TODO: einsum diagonal extraction pattern ({pattern}) not supported yet'
+            raise NotImplementedError(f"einsum diagonal extraction pattern ({pattern}) not supported yet")
 
         # Pattern: 'ij->ji' (transpose)
         elif len(input_patterns) == 1 and len(input_patterns[0]) == 2 and len(rhs) == 2:
@@ -936,7 +1154,7 @@ class WebNNGraphGenerator:
                 return f'[{output}] = transpose({input1}, permutation=[1, 0]);'
 
         # Unknown pattern
-        return f'// TODO: einsum pattern not yet supported: {pattern}'
+        raise NotImplementedError(f"einsum pattern not yet supported: {pattern}")
 
     def _convert_scaled_dot_product_attention(self, node: fx.Node, output: str, inputs: List[str]) -> str:
         """
@@ -956,7 +1174,7 @@ class WebNNGraphGenerator:
             Output tensor of shape [batch, num_heads, seq_len_q, head_dim]
         """
         if len(inputs) < 3:
-            return f'// Invalid scaled_dot_product_attention: need Q, K, V inputs'
+            raise NotImplementedError('Invalid scaled_dot_product_attention: need Q, K, V inputs')
 
         Q = inputs[0]
         K = inputs[1]
@@ -1217,7 +1435,7 @@ class WebNNGraphGenerator:
                     self.operand_counter += 1
                     return (
                         f'[{mm_out}] = gemm({input_tensor}, {weight}, bTranspose=true);\n'
-                        f'    [{output}] = add({mm_out}, {bias});'
+                        f'\t[{output}] = add({mm_out}, {bias});'
                     )
                 else:
                     return f'[{output}] = gemm({input_tensor}, {weight}, bTranspose=true);'
@@ -1397,7 +1615,11 @@ class WebNNGraphGenerator:
         if len(inputs) > 0:
             inputs_str = ', '.join(inputs)
             return f'[{output}] = concat([{inputs_str}], axis={axis});'
-        return f'// Invalid concat operation'
+        else:
+            if len(node.args) >= 1 and isinstance(node.args[0], (list, tuple)):
+                concat_inputs = ",".join([self._get_operand_name(n) for n in node.args[0]])
+                return f'[{output}] = concat([{concat_inputs}], axis={axis});'
+            raise NotImplementedError('Invalid concat: no inputs')
 
     def _convert_stack(self, node: fx.Node, output: str, inputs: List[str]) -> str:
         """
@@ -1415,7 +1637,7 @@ class WebNNGraphGenerator:
             dim = node.kwargs['axis']
 
         if not inputs:
-            return f'// Invalid stack: no inputs'
+            raise NotImplementedError('Invalid stack: no inputs')
 
         # Get shape of first input to understand dimensions
         if len(node.args) > 0 and isinstance(node.args[0], (list, tuple)):
@@ -1624,7 +1846,7 @@ class WebNNGraphGenerator:
         """
         if len(inputs) == 1:
             return f'[{output}] = identity({inputs[0]});'
-        return '// Invalid identity operation'
+        raise NotImplementedError('Invalid identity operation')
 
     def _create_inline_constant(self, value) -> str:
         """
@@ -1661,7 +1883,7 @@ class WebNNGraphGenerator:
                 shape_str = ', '.join(map(str, shape))
                 raw = value.cpu().numpy().tobytes()
                 byte_list = ', '.join(str(b) for b in raw)
-                consts.append(f'    {name}: {dtype}[{shape_str}] @bytes([{byte_list}]);')
+                consts.append(f'\t{name}: {dtype}[{shape_str}] @bytes([{byte_list}]);')
             else:
                 if isinstance(value, float):
                     dtype = 'f32'
@@ -1670,7 +1892,7 @@ class WebNNGraphGenerator:
                 else:
                     dtype = 'f32'  # default
 
-                consts.append(f'    {name}: {dtype}[] @scalar({value});')
+                consts.append(f'\t{name}: {dtype}[] @scalar({value});')
 
         return '\n'.join(consts) + '\n' if consts else ''
 
@@ -1704,9 +1926,12 @@ class WebNNGraphGenerator:
 
     def _get_operand_name(self, node: fx.Node) -> str:
         """Get or create operand name for a node"""
-        if node.name not in self.node_to_operand:
-            self.node_to_operand[node.name] = f'operand_{self.operand_counter}'
-            self.operand_counter += 1
+        try:
+            if node.name not in self.node_to_operand:
+                self.node_to_operand[node.name] = f'operand_{self.operand_counter}'
+                self.operand_counter += 1
+        except AttributeError as e:
+            print(f"Error: {e}")
         return self.node_to_operand[node.name]
 
     def _get_input_operand(self, node) -> str:
@@ -1718,6 +1943,15 @@ class WebNNGraphGenerator:
                 key = self._placeholder_to_state_key(node.name)
                 if key in self.weight_operands:
                     return self.weight_operands[key]
+                # TODO there must be a better way to understand where '_''s are coming from in the first place and correctly parse this
+                # Fallback: names like `running_mean` contain underscores that
+                # _placeholder_to_state_key splits into separate dot-segments
+                # (e.g. "bn.running.mean" instead of "bn.running_mean").
+                # Normalise both sides by collapsing dots and underscores and retry.
+                key_flat = key.replace('.', '_')
+                for state_key, operand in self.weight_operands.items():
+                    if state_key.replace('.', '_') == key_flat:
+                        return operand
             if node.name in self.node_to_operand:
                 return self.node_to_operand[node.name]
             else:
@@ -1735,13 +1969,12 @@ class WebNNGraphGenerator:
         if key.startswith('l_'):
             key = key[2:]
         hierarchy = key.split('_')
-        if hierarchy[0] == 'self':
-            hierarchy.pop(0)
         if hierarchy[-1] == '':
             hierarchy.pop(-1)
 
         hierarchy = filter(lambda x: x not in IGNORED_PLACEHOLDER_TOKENS, hierarchy)
-        return '.'.join(hierarchy)
+        placeholder_name = '.'.join(hierarchy)
+        return placeholder_name
 
     def _get_webnn_dtype(self, dtype: torch.dtype) -> str:
         """Convert PyTorch dtype to WebNN dtype"""

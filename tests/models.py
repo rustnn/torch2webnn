@@ -161,6 +161,32 @@ class NormalizationOpsModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Batch norm models (used in test_batch_norm.py)
+# ---------------------------------------------------------------------------
+
+class SingleBatchNorm2d(nn.Module):
+    """BatchNorm2d with running mean/var (eval mode uses pre-computed stats)."""
+
+    def __init__(self, num_features: int = 16):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(num_features)
+
+    def forward(self, x):
+        return self.bn(x)
+
+
+class SingleBatchNorm2dNoRunning(nn.Module):
+    """BatchNorm2d without running stats (always computes from the current batch)."""
+
+    def __init__(self, num_features: int = 16):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(num_features, track_running_stats=False)
+
+    def forward(self, x):
+        return self.bn(x)
+
+
+# ---------------------------------------------------------------------------
 # Rearrange model (used in test_rearrange.py)
 # ---------------------------------------------------------------------------
 

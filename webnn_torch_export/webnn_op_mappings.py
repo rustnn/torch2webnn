@@ -29,7 +29,7 @@ TARGET_NAME_TO_CONVERTER: Dict[str, ConverterFn] = {
     "mm": lambda gen, node, output, inputs: gen._convert_matmul(node, output, inputs),
 
     # Normalization
-    # "batch_norm": lambda gen, node, output, inputs: gen._convert_identity(node, output, inputs),
+    "batch_norm": lambda gen, node, output, inputs: gen._convert_batch_norm(node, output, inputs),
     "layer_norm": lambda gen, node, output, inputs: gen._convert_layer_norm(node, output, inputs),
     "group_norm": lambda gen, node, output, inputs: gen._convert_group_norm(node, output, inputs),
 
@@ -79,6 +79,8 @@ TARGET_NAME_TO_CONVERTER: Dict[str, ConverterFn] = {
     "pad": lambda gen, node, output, inputs: gen._convert_pad(node, output, inputs),
     "tile": lambda gen, node, output, inputs: gen._convert_tile(node, output, inputs),
     "to": lambda gen, node, output, inputs: gen._convert_cast(node, output, inputs),
+    "float": lambda gen, node, output, inputs: gen._convert_cast(node, output, inputs, "f32"),
+    "half": lambda gen, node, output, inputs: gen._convert_cast(node, output, inputs, "f16"),
 
     # Special operations
     "rearrange": lambda gen, node, output, inputs: gen._convert_rearrange(node, output, inputs),
