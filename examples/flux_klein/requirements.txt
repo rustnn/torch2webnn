@@ -1,0 +1,13 @@
+# Flux Klein Example Requirements
+# Install with: pip install -r requirements.txt
+
+# Core dependencies (should already be installed if you have webnn_torch_export)
+torch>=2.0.0
+numpy>=1.20.0
+
+# Flux2 package - installs all necessary dependencies
+# This includes: transformers, safetensors, einops, Pillow, etc.
+git+https://github.com/black-forest-labs/flux2
+
+# WebNN runtime (for testing exported models)
+pywebnn>=0.1.0
