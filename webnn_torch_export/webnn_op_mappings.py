@@ -1,125 +1,155 @@
-"""Mapping helpers from PyTorch FX call_function targets to converter methods."""
+"""ATen op → WebNN converter dispatch table.
 
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional
+All targets are matched by str(node.target) which for ATen ops gives
+the canonical name like "aten.conv2d.default".
+"""
 
-import torch.fx as fx
+from typing import Dict, Optional
 
-if TYPE_CHECKING:
-    from .webnn_generator import WebNNGraphGenerator
+# Maps str(aten_op) → converter method name on WebNNGraphGenerator.
+ATEN_OP_TABLE: Dict[str, str] = {
+    # Convolution
+    "aten.conv2d.default": "_convert_conv2d",
+    "aten.convolution.default": "_convert_convolution",
 
-
-ConverterFn = Callable[["WebNNGraphGenerator", fx.Node, str, List[str]], str]
-
-
-EXACT_TARGET_TO_CONVERTER: Dict[str, ConverterFn] = {
-    "<built-in function iadd>": lambda gen, node, output, inputs: gen._convert_arithmetric(node, output, inputs, "add"),
-    "<built-in function mul>": lambda gen, node, output, inputs: gen._convert_arithmetric(node, output, inputs, "mul"),
-    "<built-in function truediv>": lambda gen, node, output, inputs: gen._convert_arithmetric(node, output, inputs, "div"),
-    "<built-in function getitem>": lambda gen, node, output, inputs: gen._convert_getitem(node, output, inputs),
-    "<built-in function neg>": lambda gen, node, output, inputs: gen._convert_neg(node, output, inputs),
-}
-
-
-TARGET_NAME_TO_CONVERTER: Dict[str, ConverterFn] = {
-    # Convolution and Linear
-    "conv2d": lambda gen, node, output, inputs: gen._convert_conv2d(node, output, inputs),
-    "linear": lambda gen, node, output, inputs: gen._convert_linear(node, output, inputs),
-    "addmm": lambda gen, node, output, inputs: gen._convert_addmm(node, output, inputs),
-    "matmul": lambda gen, node, output, inputs: gen._convert_matmul(node, output, inputs),
-    "mm": lambda gen, node, output, inputs: gen._convert_matmul(node, output, inputs),
-
-    # Normalization
-    "batch_norm": lambda gen, node, output, inputs: gen._convert_batch_norm(node, output, inputs),
-    "layer_norm": lambda gen, node, output, inputs: gen._convert_layer_norm(node, output, inputs),
-    "group_norm": lambda gen, node, output, inputs: gen._convert_group_norm(node, output, inputs),
+    # Linear / matmul
+    "aten.linear.default": "_convert_linear",
+    "aten.addmm.default": "_convert_addmm",
+    "aten.mm.default": "_convert_matmul",
+    "aten.matmul.default": "_convert_matmul",
+    "aten.t.default": "_convert_t",
 
     # Activations
-    "relu": lambda gen, node, output, inputs: gen._convert_relu(node, output, inputs),
-    "sigmoid": lambda gen, node, output, inputs: gen._convert_sigmoid(node, output, inputs),
-    "tanh": lambda gen, node, output, inputs: gen._convert_tanh(node, output, inputs),
-    "softmax": lambda gen, node, output, inputs: gen._convert_softmax(node, output, inputs),
-    "hardtanh": lambda gen, node, output, inputs: gen._convert_hardtanh(node, output, inputs),
-    "clamp": lambda gen, node, output, inputs: gen._convert_clamp(node, output, inputs),
-    "silu": lambda gen, node, output, inputs: gen._convert_silu(node, output, inputs),
+    "aten.relu.default": "_convert_relu",
+    "aten.relu_.default": "_convert_relu",
+    "aten.sigmoid.default": "_convert_sigmoid",
+    "aten.tanh.default": "_convert_tanh",
+    "aten.silu.default": "_convert_silu",
+    "aten.silu_.default": "_convert_silu",
+    "aten.hardtanh.default": "_convert_hardtanh",
+    "aten.hardtanh_.default": "_convert_hardtanh",
+    "aten.clamp.default": "_convert_clamp",
+    "aten.clamp_.default": "_convert_clamp",
+    "aten.gelu.default": "_convert_gelu",
 
-    # Arithmetic
-    "add": lambda gen, node, output, inputs: gen._convert_arithmetric(node, output, inputs, "add"),
-    "sub": lambda gen, node, output, inputs: gen._convert_arithmetric(node, output, inputs, "sub"),
-    "mul": lambda gen, node, output, inputs: gen._convert_arithmetric(node, output, inputs, "mul"),
-    "div": lambda gen, node, output, inputs: gen._convert_arithmetric(node, output, inputs, "div"),
-
-    # Math functions
-    "sqrt": lambda gen, node, output, inputs: gen._convert_math(node, output, inputs, "sqrt"),
-    "exp": lambda gen, node, output, inputs: gen._convert_math(node, output, inputs, "exp"),
-    "abs": lambda gen, node, output, inputs: gen._convert_math(node, output, inputs, "abs"),
-    "log": lambda gen, node, output, inputs: gen._convert_math(node, output, inputs, "log"),
-    "cos": lambda gen, node, output, inputs: gen._convert_math(node, output, inputs, "cos"),
-    "sin": lambda gen, node, output, inputs: gen._convert_math(node, output, inputs, "sin"),
-    "pow": lambda gen, node, output, inputs: gen._convert_pow(node, output, inputs),
+    # Normalization
+    "aten.batch_norm.default": "_convert_batch_norm_aten",
+    "aten._native_batch_norm_legit_no_training.default": "_convert_batch_norm_no_training",
+    "aten.layer_norm.default": "_convert_layer_norm",
+    "aten.group_norm.default": "_convert_group_norm",
 
     # Pooling
-    "adaptive_avg_pool": lambda gen, node, output, inputs: gen._convert_global_avg_pool(node, output, inputs),
-    "avg_pool2d": lambda gen, node, output, inputs: gen._convert_avg_pool2d(node, output, inputs),
-    "max_pool2d": lambda gen, node, output, inputs: gen._convert_max_pool2d(node, output, inputs),
-    "mean": lambda gen, node, output, inputs: gen._convert_reduce_mean(node, output, inputs),
+    "aten.max_pool2d.default": "_convert_max_pool2d",
+    "aten.max_pool2d_with_indices.default": "_convert_max_pool2d",
+    "aten.avg_pool2d.default": "_convert_avg_pool2d",
+    "aten.adaptive_avg_pool2d.default": "_convert_global_avg_pool",
+    "aten.mean.dim": "_convert_reduce_mean",
+    "aten.mean.default": "_convert_reduce_mean",
 
-    # Tensor manipulation
-    "flatten": lambda gen, node, output, inputs: gen._convert_reshape(node, output, inputs),
-    "view": lambda gen, node, output, inputs: gen._convert_reshape(node, output, inputs),
-    "reshape": lambda gen, node, output, inputs: gen._convert_reshape(node, output, inputs),
-    "transpose": lambda gen, node, output, inputs: gen._convert_transpose(node, output, inputs),
-    "t": lambda gen, node, output, inputs: gen._convert_transpose(node, output, inputs),
-    "permute": lambda gen, node, output, inputs: gen._convert_transpose(node, output, inputs),
-    "concat": lambda gen, node, output, inputs: gen._convert_concat(node, output, inputs),
-    "cat": lambda gen, node, output, inputs: gen._convert_concat(node, output, inputs),
-    "stack": lambda gen, node, output, inputs: gen._convert_stack(node, output, inputs),
-    "split": lambda gen, node, output, inputs: gen._convert_split(node, output, inputs),
-    "slice": lambda gen, node, output, inputs: gen._convert_slice(node, output, inputs),
-    "expand": lambda gen, node, output, inputs: gen._convert_expand(node, output, inputs),
-    "pad": lambda gen, node, output, inputs: gen._convert_pad(node, output, inputs),
-    "tile": lambda gen, node, output, inputs: gen._convert_tile(node, output, inputs),
-    "to": lambda gen, node, output, inputs: gen._convert_cast(node, output, inputs),
-    "float": lambda gen, node, output, inputs: gen._convert_cast(node, output, inputs, "f32"),
-    "half": lambda gen, node, output, inputs: gen._convert_cast(node, output, inputs, "f16"),
+    # Arithmetic
+    "aten.add.Tensor": "_convert_add",
+    "aten.add.Scalar": "_convert_add",
+    "aten.add_.Tensor": "_convert_add",
+    "aten.sub.Tensor": "_convert_sub",
+    "aten.sub.Scalar": "_convert_sub",
+    "aten.mul.Tensor": "_convert_mul",
+    "aten.mul.Scalar": "_convert_mul",
+    "aten.div.Tensor": "_convert_div",
+    "aten.div.Scalar": "_convert_div",
+    "aten.neg.default": "_convert_neg",
+    "aten.pow.Tensor_Scalar": "_convert_pow",
+    "aten.pow.Tensor_Tensor": "_convert_pow",
+    "aten.pow.Scalar": "_convert_pow_scalar",
 
-    # Special operations
-    "rearrange": lambda gen, node, output, inputs: gen._convert_rearrange(node, output, inputs),
-    "arange": lambda gen, node, output, inputs: gen._convert_arange(node, output, inputs),
-    # "dropout": lambda gen, node, output, inputs: gen._convert_identity(node, output, inputs),
-    "einsum": lambda gen, node, output, inputs: gen._convert_einsum(node, output, inputs),
-    "scaled_dot_product_attention": lambda gen, node, output, inputs: gen._convert_scaled_dot_product_attention(node, output, inputs),
-    "interpolate": lambda gen, node, output, inputs: gen._convert_interpolate(node, output, inputs),
+    # Elementwise math
+    "aten.sqrt.default": "_convert_math_sqrt",
+    "aten.exp.default": "_convert_math_exp",
+    "aten.abs.default": "_convert_math_abs",
+    "aten.log.default": "_convert_math_log",
+    "aten.cos.default": "_convert_math_cos",
+    "aten.sin.default": "_convert_math_sin",
+    "aten.rsqrt.default": "_convert_rsqrt",
+    "aten.reciprocal.default": "_convert_reciprocal",
 
-    # No OP
-    "identity": lambda gen, node, output, inputs: gen._convert_identity(node, output, inputs),
-    "contiguous": lambda gen, node, output, inputs: gen._convert_identity(node, output, inputs),
+    # Tensor shape manipulation
+    "aten.reshape.default": "_convert_reshape",
+    "aten.view.default": "_convert_reshape",
+    "aten._unsafe_view.default": "_convert_reshape",
+    "aten.flatten.using_ints": "_convert_reshape",
+    "aten.permute.default": "_convert_permute",
+    "aten.transpose.int": "_convert_transpose",
+    "aten.unsqueeze.default": "_convert_unsqueeze",
+    "aten.squeeze.dim": "_convert_squeeze",
+    "aten.squeeze.default": "_convert_squeeze",
+    "aten.cat.default": "_convert_concat",
+    "aten.stack.default": "_convert_stack",
+    "aten.split.Tensor": "_convert_split",
+    "aten.split_with_sizes.default": "_convert_split",
+    "aten.chunk.default": "_convert_chunk",
+    "aten.unbind.int": "_convert_unbind",
+    "aten.select.int": "_convert_select",
+    "aten.einsum.default": "_convert_einsum",
+    "aten.slice.Tensor": "_convert_slice",
+    "aten.expand.default": "_convert_expand",
+    "aten.expand_as.default": "_convert_expand_as",
+
+    # Padding
+    "aten.constant_pad_nd.default": "_convert_pad",
+    "aten.pad.default": "_convert_pad",
+
+    # Upsampling
+    "aten.upsample_nearest2d.vec":     "_convert_upsample_nearest2d",
+    "aten.upsample_nearest2d.default": "_convert_upsample_nearest2d",
+    "aten.upsample_bilinear2d.vec":    "_convert_upsample_bilinear2d",
+    "aten.upsample_bilinear2d.default":"_convert_upsample_bilinear2d",
+
+    # Softmax / attention
+    "aten.softmax.int": "_convert_softmax",
+    "aten._softmax.default": "_convert_softmax_aten",
+    "aten.scaled_dot_product_attention.default": "_convert_scaled_dot_product_attention",
+
+    # Compile-time constant generation
+    "aten.arange.default":      "_convert_arange",
+    "aten.arange.start":        "_convert_arange",
+    "aten.arange.start_step":   "_convert_arange",
+    "aten.full.default":        "_convert_full",
+    "aten.zeros.default":       "_convert_full_zeros",
+    "aten.ones.default":        "_convert_full_ones",
+
+    # No-ops / memory ops
+    "aten.clone.default": "_convert_identity",
+    "aten.contiguous.default": "_convert_identity",
+    "aten._assert_tensor_metadata.default": "_convert_identity",
+    "aten.contiguous.memory_format": "_convert_identity",
+    "aten.dropout.default": "_convert_identity",
+    "aten.alias.default": "_convert_identity",
+
+    # Type cast
+    "aten._to_copy.default":  "_convert_cast",
+    "aten.to.dtype":          "_convert_cast",
+    "aten.to.device":         "_convert_to_device",
+    "aten.to.dtype_layout":   "_convert_cast",
+    "aten.type_as.default":   "_convert_type_as",
+
+    # Tuple/list indexing (from chunk, unbind, split)
+    "<built-in function getitem>": "_convert_getitem",
 }
 
-SCHEMA_CONTAINS_TO_CONVERTER: Dict[str, ConverterFn] = {
-    "convolution": lambda gen, node, output, inputs: gen._convert_conv2d(node, output, inputs),
-    "relu": lambda gen, node, output, inputs: gen._convert_relu(node, output, inputs),
-    "add": lambda gen, node, output, inputs: gen._convert_arithmetric(node, output, inputs, "add"),
-}
+
+def resolve_aten_converter(target) -> Optional[str]:
+    """Return converter method name for an ATen (or other) op target, or None."""
+    return ATEN_OP_TABLE.get(str(target))
 
 
-def resolve_pytorch_converter(target) -> Optional[ConverterFn]:
-    """Resolve converter callable for a PyTorch FX call_function target."""
-    target_str = str(target)
+if __name__ == "__main__":
+    from torch._decomp import _core_aten_decompositions_post_autograd
 
-    if target_str in EXACT_TARGET_TO_CONVERTER:
-        return EXACT_TARGET_TO_CONVERTER[target_str]
+    aten_ops = _core_aten_decompositions_post_autograd()
+    aten_ops_as_str = set(".".join((op.name().split("::"))) for op in aten_ops.keys())
+    supported_aten_str = set(ATEN_OP_TABLE.keys())
 
-    if target_str in TARGET_NAME_TO_CONVERTER:
-        return TARGET_NAME_TO_CONVERTER[target_str]
+    missing_aten = aten_ops_as_str.difference(supported_aten_str)
+    # filter any op that contains "backward"
+    missing_aten_non_bwd = [op for op in missing_aten if "backward" not in op]
 
-    target_name = getattr(target, "__name__", None)
-    if target_name in TARGET_NAME_TO_CONVERTER:
-        return TARGET_NAME_TO_CONVERTER[target_name]
-
-    schema = getattr(target, "_schema", None)
-    if schema is not None:
-        schema_str = str(schema)
-        if schema_str in SCHEMA_CONTAINS_TO_CONVERTER.items():
-            return SCHEMA_CONTAINS_TO_CONVERTER[schema_str]
-
-    return None
+    print(missing_aten_non_bwd)

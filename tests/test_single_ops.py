@@ -5,7 +5,7 @@ Covers: Conv2d, matmul, Linear × multiple configurations.
 
 import pytest
 import torch
-from .models import SingleConv, SingleMatmul, SingleLinear, SingleMM, SingleAddMM, SingleScaledDotProduct
+from .models import SingleConv, SingleMatmul, SingleLinear, SingleMM, SingleAddMM, SingleScaledDotProduct, SingleEinsum
 from .conftest import assert_export_matches, validate_webnn_execution
 
 
@@ -110,4 +110,24 @@ def test_attention_op(attn_config, qkv_shape):
     v = torch.randn(*qkv_shape)
     assert_export_matches(model, (q, k, v), rtol=1e-3, atol=1e-3)
     validate_webnn_execution(model, (q, k, v), rtol=1e-3, atol=1e-3)
+
+
+# (id, a_shape, b_shape)  — pattern '...n,d->...nd'
+EINSUM_OPS = [
+    ("2d_8x16",  (4, 8),    (16,)),
+    ("3d_2x4x8", (2, 4, 8), (16,)),
+]
+
+
+@pytest.mark.parametrize(
+    "a_shape,b_shape",
+    [(c[1], c[2]) for c in EINSUM_OPS],
+    ids=[c[0] for c in EINSUM_OPS],
+)
+def test_einsum_op(a_shape, b_shape):
+    torch._dynamo.reset()
+    model = SingleEinsum()
+    a = torch.randn(*a_shape)
+    b = torch.randn(*b_shape)
+    assert_export_matches(model, (a, b), rtol=1e-4, atol=1e-4)
 

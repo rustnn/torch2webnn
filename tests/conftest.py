@@ -46,19 +46,21 @@ def assert_export_matches(
     with torch.no_grad():
         expected = model(*example_input) if isinstance(example_input, tuple) else model(example_input)
 
-    compiled_model, exporter = export_model(model, example_input, debug=debug)
+    exporter, ep = export_model(model, example_input, debug=debug)
 
+    # ep.module() runs the exported ATen graph — should match the original model
+    exported_callable = ep.module()
     with torch.no_grad():
-        actual = compiled_model(*example_input) if isinstance(example_input, tuple) else compiled_model(example_input)
+        actual = exported_callable(*example_input) if isinstance(example_input, tuple) else exported_callable(example_input)
 
     if not torch.allclose(expected, actual, rtol=rtol, atol=atol):
         max_diff = torch.max(torch.abs(expected - actual)).item()
         raise AssertionError(
-            f"Compiled output doesn't match PyTorch\n"
+            f"Exported output doesn't match PyTorch\n"
             f"  Max diff: {max_diff:.2e}  (rtol={rtol}, atol={atol})"
         )
 
-    return compiled_model, exporter
+    return exported_callable, exporter
 
 
 def validate_webnn_execution(
@@ -115,7 +117,7 @@ def validate_webnn_execution(
                 expected_output = model(example_input)
 
         # Export to WebNN with executor
-        executor, exporter = export_model_with_weights(
+        result, ep_or_exporter = export_model_with_weights(
             model,
             example_input,
             webnn_path=webnn_path,
@@ -123,6 +125,8 @@ def validate_webnn_execution(
             debug=debug,
             return_executor=True
         )
+        executor = result
+        exporter = ep_or_exporter
 
         # Verify executor was created
         assert executor is not None, "WebNNExecutor was not created"

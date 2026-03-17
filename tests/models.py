@@ -77,6 +77,13 @@ class SingleScaledDotProduct(nn.Module):
         return F.scaled_dot_product_attention(q, k, v)
 
 
+class SingleEinsum(nn.Module):
+    """Wrapper for testing torch.einsum with the '...n,d->...nd' pattern (used in Flux RoPE)."""
+
+    def forward(self, a, b):
+        return torch.einsum("...n,d->...nd", a, b)
+
+
 # ---------------------------------------------------------------------------
 # Multiple-input models (used in test_multiple_inputs.py)
 # ---------------------------------------------------------------------------

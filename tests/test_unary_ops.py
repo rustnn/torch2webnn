@@ -1,6 +1,7 @@
 """
 Parametrized tests for unary element-wise operations.
-Covers: exp, abs, sqrt, log, sigmoid, tanh, relu × multiple input shapes.
+Covers: exp, abs, sqrt, log, sigmoid, tanh, relu, rsqrt, reciprocal,
+        pow.Scalar × multiple input shapes.
 """
 
 import pytest
@@ -24,13 +25,16 @@ def _make_unary_model(op):
 # (id, model_class, input_factory)
 # input_factory takes shape tuple and returns a tensor safe for the op
 UNARY_OPS = [
-    ("exp", torch.exp, lambda s: torch.randn(*s)),
-    ("abs", torch.abs, lambda s: torch.randn(*s)),
-    ("sqrt", torch.sqrt, lambda s: torch.randn(*s).abs() + 1e-3),
-    ("log", torch.log, lambda s: torch.randn(*s).abs() + 1e-3),
-    ("sigmoid", torch.sigmoid, lambda s: torch.randn(*s)),
-    ("tanh", torch.tanh, lambda s: torch.randn(*s)),
-    ("relu", F.relu, lambda s: torch.randn(*s)),
+    ("exp",        torch.exp,                      lambda s: torch.randn(*s)),
+    ("abs",        torch.abs,                      lambda s: torch.randn(*s)),
+    ("sqrt",       torch.sqrt,                     lambda s: torch.randn(*s).abs() + 1e-3),
+    ("log",        torch.log,                      lambda s: torch.randn(*s).abs() + 1e-3),
+    ("sigmoid",    torch.sigmoid,                  lambda s: torch.randn(*s)),
+    ("tanh",       torch.tanh,                     lambda s: torch.randn(*s)),
+    ("relu",       F.relu,                         lambda s: torch.randn(*s)),
+    ("rsqrt",      torch.rsqrt,                    lambda s: torch.rand(*s) + 0.1),
+    ("reciprocal", torch.reciprocal,               lambda s: torch.rand(*s) + 0.1),
+    ("pow_scalar", lambda x: torch.pow(2.0, x),   lambda s: torch.randn(*s) * 0.5),
 ]
 
 SHAPES = [

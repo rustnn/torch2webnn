@@ -38,9 +38,6 @@ dev = [
     "pywebnn @ git+https://github.com/gedoensmax/pywebnn.git@maximilianm/safetensor_support",
 ]
 
-[project.scripts]
-webnn-export = "webnn_torch_export.exporter:main"
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]

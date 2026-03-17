@@ -1,4 +1,4 @@
-"""Test rearrange operation export"""
+"""Test shape operation export"""
 
 import pytest
 import torch
