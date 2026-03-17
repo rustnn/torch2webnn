@@ -1238,6 +1238,8 @@ class WebNNGraphGenerator:
         """aten.softmax.int(input, dim, half_to_float)"""
         x = inputs[0] if inputs else "unknown"
         axis = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", -1)
+        if axis == -1:
+            axis = len(self._get_node_shape(node.args[0])) - 1
         return f"[{output}] = softmax({x}, axis={axis});"
 
     def _convert_softmax_aten(self, node: fx.Node, output: str, inputs: List[str]) -> str:
@@ -1267,11 +1269,12 @@ class WebNNGraphGenerator:
         perm_str = ", ".join(map(str, perm))
 
         kt, qk, qk_sc, attn_w = tmp(), tmp(), tmp(), tmp()
+        axis = len(q_shape) - 1
         return "\n\t".join([
             f"[{kt}] = transpose({K}, permutation=[{perm_str}]);",
             f"[{qk}] = matmul({Q}, {kt});",
             f"[{qk_sc}] = mul({qk}, {scale_c});",
-            f"[{attn_w}] = softmax({qk_sc}, axis=-1);",
+            f"[{attn_w}] = softmax({qk_sc}, axis={axis});",
             f"[{output}] = matmul({attn_w}, {V});",
         ])
 
