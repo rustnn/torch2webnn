@@ -876,6 +876,12 @@ class WebNNGraphGenerator:
             axis = node.kwargs["dim"]
         elif len(node.args) > 1 and not isinstance(node.args[1], fx.Node):
             axis = node.args[1]
+        if axis < 0:
+            tensor_list = node.args[0]
+            first_tensor = tensor_list[0] if isinstance(tensor_list, (list, tuple)) else tensor_list
+            ndim = len(self._get_node_shape(first_tensor))
+            if ndim > 0:
+                axis = ndim + axis
         if inputs:
             return f"[{output}] = concat([{', '.join(inputs)}], axis={axis});"
         if len(node.args) >= 1 and isinstance(node.args[0], (list, tuple)):

@@ -168,6 +168,21 @@ class NormalizationOpsModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Concat models (used in test_concat.py)
+# ---------------------------------------------------------------------------
+
+class ConcatModel(nn.Module):
+    """Concatenate any number of tensors along the given axis."""
+
+    def __init__(self, axis: int):
+        super().__init__()
+        self.axis = axis
+
+    def forward(self, *tensors):
+        return torch.cat(tensors, dim=self.axis)
+
+
+# ---------------------------------------------------------------------------
 # Batch norm models (used in test_batch_norm.py)
 # ---------------------------------------------------------------------------
 

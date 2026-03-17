@@ -4,12 +4,13 @@ import pytest
 import torch
 import torch.nn as nn
 from .models import (
+    ConcatModel,
+    NormalizationOpsModel,
     PointwiseActivationsModel,
     PointwiseArithmeticModel,
     PointwiseMathModel,
     ReductionOpsModel,
     ShapeOpsModel,
-    NormalizationOpsModel,
 )
 from .conftest import assert_export_matches, validate_webnn_execution
 
@@ -184,6 +185,26 @@ def test_stack(dim, shape):
     model = StackModel(dim)
     x = torch.randn(*shape)
     assert_export_matches(model, x, rtol=1e-4, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# concat  (aten.cat)
+# ---------------------------------------------------------------------------
+
+# 4-D shape (2, 3, 4, 5) — supports axes 0, 1, 3 and their negative equivalents
+@pytest.mark.parametrize("n_inputs,axis", [
+    (2, 0), (2, 1), (2, 3), (2, -1), (2, -3),
+    (5, 0), (5, 1), (5, 3), (5, -1), (5, -3),
+], ids=[f"{n}in_ax{a}" for n, a in [
+    (2, 0), (2, 1), (2, 3), (2, -1), (2, -3),
+    (5, 0), (5, 1), (5, 3), (5, -1), (5, -3),
+]])
+def test_concat(n_inputs, axis):
+    torch._dynamo.reset()
+    model = ConcatModel(axis)
+    inputs = tuple(torch.randn(2, 3, 4, 5) for _ in range(n_inputs))
+    assert_export_matches(model, inputs)
+    validate_webnn_execution(model, inputs)
 
 
 # ---------------------------------------------------------------------------
