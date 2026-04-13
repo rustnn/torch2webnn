@@ -10,22 +10,44 @@ from .conftest import assert_export_matches, validate_webnn_execution
 
 
 class ConvOpConfig:
-    def __init__(self, in_cannels, out_channels, kernel_size, stride, padding):
-        self.in_cannels = in_cannels
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                 padding=0, dilation=1, bias=True):
+        self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
+        self.dilation = dilation
+        self.bias = bias
 
     def name(self):
-        return f"conv_{self.in_cannels}x{self.out_channels}_{self.kernel_size}x{self.kernel_size}"
+        parts = [f"conv_{self.in_channels}x{self.out_channels}_k{self.kernel_size}"]
+        if self.stride != 1:
+            parts.append(f"s{self.stride}")
+        if self.dilation != 1:
+            parts.append(f"d{self.dilation}")
+        if not self.bias:
+            parts.append("nobias")
+        return "_".join(parts)
 
 
-CONV_OPS = [ # config, input_shape
-    (ConvOpConfig(16, 32, 3, stride=1, padding=1), (1, 16, 10, 10)),
-    (ConvOpConfig(1,  32, 5, stride=1, padding=2), (1, 1,  28, 28)),
-    (ConvOpConfig(3,  64, 3, stride=1, padding=1), (1, 3,  28, 28)),
-    (ConvOpConfig(16, 32, 1, stride=1, padding=0), (1, 16, 28, 28)),
+CONV_OPS = [  # (config, input_shape)
+    # baseline
+    (ConvOpConfig(16, 32, 3, padding=1),                          (1, 16, 10, 10)),
+    (ConvOpConfig(1,  32, 5, padding=2),                          (1, 1,  28, 28)),
+    (ConvOpConfig(3,  64, 3, padding=1),                          (1, 3,  28, 28)),
+    (ConvOpConfig(16, 32, 1, padding=0),                          (1, 16, 28, 28)),
+    # no bias
+    (ConvOpConfig(16, 32, 3, padding=1, bias=False),              (1, 16, 10, 10)),
+    (ConvOpConfig(3,  64, 3, padding=1, bias=False),              (1, 3,  28, 28)),
+    # stride > 1
+    (ConvOpConfig(16, 32, 3, stride=2, padding=1),                (1, 16, 14, 14)),
+    (ConvOpConfig(3,  32, 3, stride=2, padding=1),                (1, 3,  28, 28)),
+    (ConvOpConfig(16, 32, 3, stride=2, padding=1, bias=False),    (1, 16, 14, 14)),
+    # dilation > 1  (padding = dilation to preserve spatial size)
+    (ConvOpConfig(16, 32, 3, dilation=2, padding=2),              (1, 16, 14, 14)),
+    (ConvOpConfig(3,  32, 3, dilation=2, padding=2),              (1, 3,  28, 28)),
+    (ConvOpConfig(16, 32, 3, dilation=2, padding=2, bias=False),  (1, 16, 14, 14)),
 ]
 
 class GemmOpConfig:
@@ -78,7 +100,15 @@ ATTN_OPS = [ # config, qkv_shape
 )
 def test_conv_op(conv_config, input_shape):
     torch._dynamo.reset()
-    model = SingleConv(conv_config.in_cannels, conv_config.out_channels, conv_config.kernel_size, conv_config.stride)
+    model = SingleConv(
+        conv_config.in_channels,
+        conv_config.out_channels,
+        conv_config.kernel_size,
+        padding=conv_config.padding,
+        stride=conv_config.stride,
+        dilation=conv_config.dilation,
+        bias=conv_config.bias,
+    )
     x = torch.randn(*input_shape)
     assert_export_matches(model, x, rtol=1e-3)
     validate_webnn_execution(model, x)

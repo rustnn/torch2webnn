@@ -63,6 +63,38 @@ def assert_export_matches(
     return exported_callable, exporter
 
 
+def assert_generates_webnn(
+    model: torch.nn.Module,
+    example_input: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    debug: bool = False,
+) -> str:
+    """
+    Export a model and generate its WebNN graph text, returning the text.
+
+    Does NOT require the WebNN runtime — only exercises the generator.
+    Useful for asserting that the generator produces valid output for a given op.
+    """
+    from webnn_torch_export import export_model
+    import tempfile
+    import os
+
+    if not isinstance(example_input, tuple):
+        example_input = (example_input,)
+
+    model.eval()
+    exporter, _ = export_model(model, example_input, debug=debug)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".webnn", delete=False) as f:
+        path = f.name
+    try:
+        exporter.save_to_webnn(path)
+        with open(path) as f:
+            return f.read()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
 def validate_webnn_execution(
     model: torch.nn.Module,
     example_input: Union[torch.Tensor, Tuple[torch.Tensor, ...]],

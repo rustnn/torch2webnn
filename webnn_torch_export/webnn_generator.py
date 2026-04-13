@@ -280,27 +280,7 @@ class WebNNGraphGenerator:
             bias_info = (bias_operand, bias_shape[0] if bias_shape else 0)
 
         return self._emit_conv2d(input_tensor, weight, bias_info, stride, padding, dilation, groups, output)
-
-    def _convert_convolution(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.convolution.default(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups)"""
-        args = node.args
-        input_tensor = inputs[0] if inputs else "unknown"
-        weight = self._get_input_operand(args[1]) if len(args) > 1 else "unknown"
-
-        stride = args[3] if len(args) > 3 else [1, 1]
-        padding = args[4] if len(args) > 4 else [0, 0]
-        dilation = args[5] if len(args) > 5 else [1, 1]
-        groups = args[8] if len(args) > 8 else 1
-
-        bias_info = None
-        bias_node = args[2] if len(args) > 2 else None
-        if isinstance(bias_node, fx.Node):
-            bias_operand = self._get_input_operand(bias_node)
-            bias_shape = self.operand_shapes.get(bias_operand, [])
-            bias_info = (bias_operand, bias_shape[0] if bias_shape else 0)
-
-        return self._emit_conv2d(input_tensor, weight, bias_info, stride, padding, dilation, groups, output)
-
+    
     # --- Linear ---
 
     def _convert_linear(self, node: fx.Node, output: str, inputs: List[str]) -> str:
@@ -928,6 +908,8 @@ class WebNNGraphGenerator:
         x = inputs[0] if inputs else "unknown"
         sections = node.args[1] if len(node.args) > 1 else None
         dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", 0)
+        if dim == -1:
+            dim = len(self._get_node_shape(node.args[0])) - 1
         if isinstance(sections, (list, tuple)):
             # Multi-output split: pre-allocate one operand per section
             out_ops = []
@@ -942,10 +924,12 @@ class WebNNGraphGenerator:
         if in_shape and sections is not None:
             dim_n = int(dim) % len(in_shape)
             dim_size = in_shape[dim_n]
-            n = int(sections)
-            base = dim_size // n
-            rem = dim_size % n
-            sizes = [base + (1 if i < rem else 0) for i in range(n)]
+            split_size = int(sections)
+            n = dim_size // split_size
+            rem = dim_size % split_size
+            sizes = [split_size] * n
+            if rem:
+                sizes.append(rem)
             out_ops = []
             for _ in sizes:
                 op = f"operand_{self.operand_counter}"

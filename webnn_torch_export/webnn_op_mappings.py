@@ -10,7 +10,6 @@ from typing import Dict, Optional
 ATEN_OP_TABLE: Dict[str, str] = {
     # Convolution
     "aten.conv2d.default": "_convert_conv2d",
-    "aten.convolution.default": "_convert_convolution",
 
     # Linear / matmul
     "aten.linear.default": "_convert_linear",
