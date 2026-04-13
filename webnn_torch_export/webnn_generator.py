@@ -242,7 +242,7 @@ class WebNNGraphGenerator:
         params.append(f"groups={groups}")
         params.append('inputLayout="nchw"')
         if padding != [0, 0]:
-            params.append(f"pads=[{padding[0]}, {padding[0]}, {padding[1]}, {padding[1]}]")
+            params.append(f"padding=[{padding[0]}, {padding[0]}, {padding[1]}, {padding[1]}]")
         if stride != [1, 1]:
             params.append(f"strides=[{stride[0]}, {stride[1]}]")
 
