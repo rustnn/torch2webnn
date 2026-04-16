@@ -905,13 +905,16 @@ class WebNNGraphGenerator:
         return "\n\t".join(steps)
 
     def _convert_split(self, node: fx.Node, output: str, inputs: List[str]) -> str:
+        return self._convert_split_via_slices(node, output, inputs) # TODO native webnn split had some issues
+
+    def _convert_split_via_split_op(self, node: fx.Node, output: str, inputs: List[str]) -> str:
+        """Original implementation: emits a single WebNN split() op."""
         x = inputs[0] if inputs else "unknown"
         sections = node.args[1] if len(node.args) > 1 else None
         dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", 0)
         if dim == -1:
             dim = len(self._get_node_shape(node.args[0])) - 1
         if isinstance(sections, (list, tuple)):
-            # Multi-output split: pre-allocate one operand per section
             out_ops = []
             for _ in sections:
                 op = f"operand_{self.operand_counter}"
@@ -919,7 +922,6 @@ class WebNNGraphGenerator:
                 out_ops.append(op)
             self.multi_output_operands[node.name] = out_ops
             return f"[{', '.join(out_ops)}] = split({x}, splits=[{', '.join(map(str, sections))}], axis={dim});"
-        # Even-split: need shape to compute sizes
         in_shape = self._get_node_shape(node.args[0]) if node.args and isinstance(node.args[0], fx.Node) else []
         if in_shape and sections is not None:
             dim_n = int(dim) % len(in_shape)
@@ -938,6 +940,51 @@ class WebNNGraphGenerator:
             self.multi_output_operands[node.name] = out_ops
             return f"[{', '.join(out_ops)}] = split({x}, splits=[{', '.join(map(str, sizes))}], axis={dim});"
         return f"[{output}] = split({x}, splits={sections}, axis={dim});"
+
+    def _convert_split_via_slices(self, node: fx.Node, output: str, inputs: List[str]) -> str:
+        """Alternative implementation: decomposes split into one slice() op per chunk."""
+        x = inputs[0] if inputs else "unknown"
+        sections = node.args[1] if len(node.args) > 1 else None
+        in_shape = self._get_node_shape(node.args[0]) if node.args and isinstance(node.args[0], fx.Node) else []
+        if not in_shape:
+            raise NotImplementedError(f"split via slices: unknown input shape for {node.name}")
+        rank = len(in_shape)
+        dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", 0)
+        dim = int(dim) % rank
+
+        if isinstance(sections, (list, tuple)):
+            sizes = list(sections)
+        elif sections is not None:
+            split_size = int(sections)
+            dim_size = in_shape[dim]
+            n = dim_size // split_size
+            rem = dim_size % split_size
+            sizes = [split_size] * n
+            if rem:
+                sizes.append(rem)
+        else:
+            raise NotImplementedError(f"split via slices: cannot determine sizes for {node.name}")
+
+        steps = []
+        out_ops = []
+        offset = 0
+        for s in sizes:
+            op = f"operand_{self.operand_counter}"
+            self.operand_counter += 1
+            out_ops.append(op)
+            starts = [0] * rank
+            slice_sizes = list(in_shape)
+            starts[dim] = offset
+            slice_sizes[dim] = s
+            steps.append(
+                f"[{op}] = slice({x}, starts=[{', '.join(map(str, starts))}], "
+                f"sizes=[{', '.join(map(str, slice_sizes))}]);"
+            )
+            offset += s
+
+        self.multi_output_operands[node.name] = out_ops
+        self.node_to_operand[node.name] = out_ops[0]
+        return "\n\t".join(steps)
 
     def _convert_chunk(self, node: fx.Node, output: str, inputs: List[str]) -> str:
         """aten.chunk.default(tensor, chunks, dim) — decompose into slice ops per chunk."""
