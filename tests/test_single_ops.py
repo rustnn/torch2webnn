@@ -6,7 +6,7 @@ Covers: Conv2d, matmul, Linear × multiple configurations.
 import pytest
 import torch
 from .models import SingleConv, SingleMatmul, SingleLinear, SingleMM, SingleAddMM, SingleScaledDotProduct, SingleEinsum
-from .conftest import assert_export_matches, validate_webnn_execution
+from .conftest import assert_export_matches, assert_generates_webnn, validate_webnn_execution
 
 
 class ConvOpConfig:
@@ -51,27 +51,33 @@ CONV_OPS = [  # (config, input_shape)
 ]
 
 class GemmOpConfig:
-    def __init__(self, in_features, out_features, batch_size, model_cls):
+    def __init__(self, in_features, out_features, input_shape, model_cls, tag=None):
         self.in_features = in_features
         self.out_features = out_features
-        self.batch_size = batch_size
+        self.input_shape = input_shape
         self.model_cls = model_cls
+        self.tag = tag
 
     def name(self):
-        batch = "vec" if self.batch_size is None else f"b{self.batch_size}"
-        return f"{self.model_cls.__name__}_{self.in_features}x{self.out_features}_{batch}"
+        shape_str = "x".join(str(d) for d in self.input_shape)
+        base = f"{self.model_cls.__name__}_{self.in_features}x{self.out_features}_{shape_str}"
+        return f"{base}_{self.tag}" if self.tag else base
 
 
-GEMM_OPS = [ # config, input_shape
-    (GemmOpConfig(784, 128,  32, SingleMatmul), (32, 784)),
-    (GemmOpConfig(784, 128,  32, SingleLinear), (32, 784)),
-    (GemmOpConfig(256,  64,   8, SingleMatmul), (8,  256)),
-    (GemmOpConfig(512, 256,  16, SingleLinear), (16, 512)),
-    (GemmOpConfig(128,  64, None, SingleMatmul), (128,)),   # mat*vec
-    (GemmOpConfig(256,  64,   8, SingleMM),     (8,  256)),
-    (GemmOpConfig(512, 128,  16, SingleMM),     (16, 512)),
-    (GemmOpConfig(256,  64,   8, SingleAddMM),  (8,  256)),
-    (GemmOpConfig(512, 128,  16, SingleAddMM),  (16, 512)),
+GEMM_OPS = [  # (config, input_shape)
+    # 2-D (classic rank-2 GEMM)
+    (GemmOpConfig(784, 128, (32, 784),  SingleMatmul), (32, 784)),
+    (GemmOpConfig(784, 128, (32, 784),  SingleLinear),  (32, 784)),
+    (GemmOpConfig(256,  64, (8,  256),  SingleMatmul), (8,  256)),
+    (GemmOpConfig(512, 256, (16, 512),  SingleLinear),  (16, 512)),
+    (GemmOpConfig(128,  64, (128,),     SingleMatmul, tag="vec"), (128,)),  # mat*vec
+    (GemmOpConfig(256,  64, (8,  256),  SingleMM),     (8,  256)),
+    (GemmOpConfig(512, 128, (16, 512),  SingleMM),     (16, 512)),
+    (GemmOpConfig(256,  64, (8,  256),  SingleAddMM),  (8,  256)),
+    (GemmOpConfig(512, 128, (16, 512),  SingleAddMM),  (16, 512)),
+    # 3-D batched (tests that matmul handles batch dims; gemm would fail here)
+    (GemmOpConfig(256,  64, (4, 8,  256), SingleLinear,  tag="batched"), (4, 8,  256)),
+    (GemmOpConfig(512, 128, (2, 16, 512), SingleMatmul,  tag="batched"), (2, 16, 512)),
 ]
 
 
@@ -124,6 +130,9 @@ def test_gemm_op(gemm_config, input_shape):
     model = gemm_config.model_cls(gemm_config.in_features, gemm_config.out_features)
     x = torch.randn(*input_shape)
     assert_export_matches(model, x, rtol=1e-3)
+    text = assert_generates_webnn(model, x)
+    assert "matmul" in text, f"Expected 'matmul' in graph:\n{text}"
+    assert "gemm" not in text, f"Unexpected 'gemm' in graph:\n{text}"
     validate_webnn_execution(model, x)
 
 

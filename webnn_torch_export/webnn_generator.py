@@ -289,41 +289,36 @@ class WebNNGraphGenerator:
             raise NotImplementedError("linear requires at least 2 inputs")
         input_tensor, weight = inputs[0], inputs[1]
 
+        weight_t = f"operand_{self.operand_counter}"
+        self.operand_counter += 1
+        mm_out = f"operand_{self.operand_counter}"
+        self.operand_counter += 1
+
+        stmts = [
+            f"[{weight_t}] = transpose({weight}, permutation=[1, 0]);",
+            f"[{mm_out}] = matmul({input_tensor}, {weight_t});",
+        ]
         if len(inputs) >= 3:
             bias = inputs[2]
-            mm_out = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            return (
-                f"[{mm_out}] = gemm({input_tensor}, {weight}, bTranspose=true);\n"
-                f"\t[{output}] = add({mm_out}, {bias});"
-            )
-        return f"[{output}] = gemm({input_tensor}, {weight}, bTranspose=true);"
+            stmts.append(f"[{output}] = add({mm_out}, {bias});")
+        else:
+            stmts.append(f"[{output}] = identity({mm_out});")
+        return "\n\t".join(stmts)
 
     def _convert_addmm(self, node: fx.Node, output: str, inputs: List[str]) -> str:
         """aten.addmm.default(bias, mat1, mat2) = bias + mat1 @ mat2"""
         if len(inputs) < 3:
             return self._convert_identity(node, output, inputs)
         bias, mat1, mat2 = inputs[0], inputs[1], inputs[2]
-        stmts = []
-
-        input_node = node.args[1] if len(node.args) > 1 and isinstance(node.args[1], fx.Node) else None
-        input_shape = self._get_node_shape(input_node) if input_node else []
-        if input_shape and len(input_shape) != 2:
-            batch = int(input_shape[0])
-            features = int(math.prod(input_shape[1:]))
-            tmp = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            stmts.append(f"[{tmp}] = reshape({mat1}, newShape=[{batch}, {features}]);")
-            mat1 = tmp
-
         mm_out = f"operand_{self.operand_counter}"
         self.operand_counter += 1
-        stmts.append(f"[{mm_out}] = gemm({mat1}, {mat2});")
-        stmts.append(f"[{output}] = add({mm_out}, {bias});")
-        return "\n\t".join(stmts)
+        return "\n\t".join([
+            f"[{mm_out}] = matmul({mat1}, {mat2});",
+            f"[{output}] = add({mm_out}, {bias});",
+        ])
 
     def _convert_matmul(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.mm / aten.matmul"""
+        """aten.mm / aten.matmul — uses WebNN matmul which supports any batch rank."""
         if len(inputs) < 2:
             raise NotImplementedError("matmul requires 2 inputs")
         a, b = inputs[0], inputs[1]
@@ -335,26 +330,30 @@ class WebNNGraphGenerator:
         b_shape = self._get_node_shape(b_node) if b_node else self.operand_shapes.get(b, [])
         out_shape = self._get_node_shape(node)
 
-        if a_shape and len(a_shape) == 1:
+        # Promote 1-D vectors to matrices so the WebNN runtime handles them safely.
+        # The extra dimension is squeezed back out via reshape after matmul.
+        a_was_1d = bool(a_shape) and len(a_shape) == 1
+        b_was_1d = bool(b_shape) and len(b_shape) == 1
+        if a_was_1d:
             tmp = f"operand_{self.operand_counter}"
             self.operand_counter += 1
             stmts.append(f"[{tmp}] = reshape({a}, newShape=[1, {a_shape[0]}]);")
             a = tmp
-        if b_shape and len(b_shape) == 1:
+        if b_was_1d:
             tmp = f"operand_{self.operand_counter}"
             self.operand_counter += 1
             stmts.append(f"[{tmp}] = reshape({b}, newShape=[{b_shape[0]}, 1]);")
             b = tmp
 
-        needs_reshape = bool(out_shape) and len(out_shape) != 2
-        gemm_out = output if not needs_reshape else f"operand_{self.operand_counter}"
+        needs_reshape = (a_was_1d or b_was_1d) and bool(out_shape)
+        mm_out = output if not needs_reshape else f"operand_{self.operand_counter}"
         if needs_reshape:
             self.operand_counter += 1
 
-        stmts.append(f"[{gemm_out}] = gemm({a}, {b});")
+        stmts.append(f"[{mm_out}] = matmul({a}, {b});")
         if needs_reshape:
             shape_str = ", ".join(str(d) for d in out_shape)
-            stmts.append(f"[{output}] = reshape({gemm_out}, newShape=[{shape_str}]);")
+            stmts.append(f"[{output}] = reshape({mm_out}, newShape=[{shape_str}]);")
         return "\n\t".join(stmts)
 
     def _convert_t(self, node: fx.Node, output: str, inputs: List[str]) -> str:
