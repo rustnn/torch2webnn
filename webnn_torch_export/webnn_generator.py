@@ -1197,17 +1197,115 @@ class WebNNGraphGenerator:
             return f"[{output}] = expand({x}, newShape=[{', '.join(map(str, shape))}]);"
         return f"[{output}] = identity({x}); // expand_as: unknown target shape"
 
-    def _convert_pad(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        x = inputs[0] if inputs else "unknown"
-        padding = node.args[1] if len(node.args) > 1 else [0, 0, 0, 0]
-        mode = node.kwargs.get("mode", "constant")
-        value = node.kwargs.get("value", 0)
+    def _flatten_pad_ints(self, padding) -> Optional[List[int]]:
+        """Coerce PyTorch padding (list/tuple/tensor of ints) to a flat int list, or None if not static."""
+        if padding is None:
+            return []
+        if isinstance(padding, torch.Tensor):
+            try:
+                return [int(x) for x in padding.detach().cpu().reshape(-1).tolist()]
+            except (TypeError, ValueError, RuntimeError):
+                return None
         if isinstance(padding, (list, tuple)):
-            pad_str = ", ".join(map(str, padding))
-            if mode == "constant":
-                return f'[{output}] = pad({x}, padding=[{pad_str}], mode="constant", value={value});'
-            return f'[{output}] = pad({x}, padding=[{pad_str}], mode="{mode}");'
-        return f"// pad: unknown parameters for {node.name}"
+            out: List[int] = []
+            for x in padding:
+                try:
+                    if isinstance(x, torch.Tensor) and x.numel() == 1:
+                        out.append(int(x.item()))
+                    else:
+                        out.append(int(x))
+                except (TypeError, ValueError):
+                    return None
+            return out
+        return None
+
+    def _pytorch_flat_pad_to_webnn(
+        self, padding_flat: List[int], rank: int
+    ) -> Optional[Tuple[List[int], List[int]]]:
+        """PyTorch F.pad / constant_pad_nd: pairs apply from last dimension backward → WebNN per-axis begin/end."""
+        if rank <= 0 or len(padding_flat) % 2 != 0:
+            return None
+        num_pairs = len(padding_flat) // 2
+        if num_pairs > rank:
+            return None
+        beginning = [0] * rank
+        ending = [0] * rank
+        for i in range(num_pairs):
+            d = rank - 1 - i
+            beginning[d] = int(padding_flat[2 * i])
+            ending[d] = int(padding_flat[2 * i + 1])
+        return beginning, ending
+
+    def _webnn_pad_mode(self, torch_mode: str) -> str:
+        m = (torch_mode or "constant").strip().lower()
+        if m in ("replicate", "replicated"):
+            return "edge"
+        if m in ("reflect", "reflection"):
+            return "reflection"
+        if m in ("constant", "edge"):
+            return m
+        return "constant"
+
+    def _format_pad_scalar(self, value) -> str:
+        try:
+            if isinstance(value, torch.Tensor) and value.numel() == 1:
+                value = value.item()
+            v = float(value)
+            if math.isfinite(v) and v == int(v) and abs(v) <= 2**53:
+                return str(int(v))
+            return repr(v)
+        except (TypeError, ValueError, RuntimeError):
+            return "0"
+
+    def _convert_pad(self, node: fx.Node, output: str, inputs: List[str]) -> str:
+        """aten.constant_pad_nd / aten.pad → WebNN pad(input, beginningPadding, endingPadding, options)."""
+        x = inputs[0] if inputs else "unknown"
+        args = node.args
+        target_str = str(node.target)
+
+        raw_pad = args[1] if len(args) > 1 else None
+        padding_flat = self._flatten_pad_ints(raw_pad)
+        if padding_flat is None:
+            return f"// pad: non-static padding for {node.name}"
+
+        in_node = args[0] if args and isinstance(args[0], fx.Node) else None
+        in_shape = self._get_node_shape(in_node) if in_node else []
+        rank = len(in_shape) if in_shape else 0
+        if rank == 0 and in_node is not None:
+            rank = len(self._get_node_shape(node))
+        if rank == 0:
+            rank = len(padding_flat) // 2
+
+        mapped = self._pytorch_flat_pad_to_webnn(padding_flat, rank)
+        if mapped is None:
+            return f"// pad: invalid padding length {len(padding_flat)} for rank {rank} ({node.name})"
+        beginning, ending = mapped
+
+        if "constant_pad_nd" in target_str:
+            mode = "constant"
+            value = args[2] if len(args) > 2 else node.kwargs.get("value", 0)
+        else:
+            mode = args[2] if len(args) > 2 and isinstance(args[2], str) else node.kwargs.get("mode", "constant")
+            if not isinstance(mode, str):
+                mode = node.kwargs.get("mode", "constant")
+                if not isinstance(mode, str):
+                    mode = "constant"
+            value = args[3] if len(args) > 3 else node.kwargs.get("value", 0)
+
+        webnn_mode = self._webnn_pad_mode(mode)
+        beg_str = ", ".join(map(str, beginning))
+        end_str = ", ".join(map(str, ending))
+
+        if webnn_mode == "constant":
+            value_str = self._format_pad_scalar(value)
+            return (
+                f'[{output}] = pad({x}, beginningPadding=[{beg_str}], '
+                f'endingPadding=[{end_str}], mode="constant", value={value_str});'
+            )
+        return (
+            f'[{output}] = pad({x}, beginningPadding=[{beg_str}], '
+            f'endingPadding=[{end_str}], mode="{webnn_mode}");'
+        )
 
     # --- Upsampling ---
 
