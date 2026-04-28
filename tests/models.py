@@ -16,9 +16,13 @@ from einops import rearrange
 class SingleConv(nn.Module):
     """Wrapper for testing single Conv2d operation"""
 
-    def __init__(self, in_channels=3, out_channels=16, kernel_size=3, padding=1):
+    def __init__(self, in_channels=3, out_channels=16, kernel_size=3, padding=1,
+                 stride=1, dilation=1, bias=True):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding)
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size,
+            padding=padding, stride=stride, dilation=dilation, bias=bias,
+        )
 
     def forward(self, x):
         return self.conv(x)
@@ -75,6 +79,13 @@ class SingleScaledDotProduct(nn.Module):
 
     def forward(self, q, k, v):
         return F.scaled_dot_product_attention(q, k, v)
+
+
+class SingleEinsum(nn.Module):
+    """Wrapper for testing torch.einsum with the '...n,d->...nd' pattern (used in Flux RoPE)."""
+
+    def forward(self, a, b):
+        return torch.einsum("...n,d->...nd", a, b)
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +172,21 @@ class NormalizationOpsModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Concat models (used in test_concat.py)
+# ---------------------------------------------------------------------------
+
+class ConcatModel(nn.Module):
+    """Concatenate any number of tensors along the given axis."""
+
+    def __init__(self, axis: int):
+        super().__init__()
+        self.axis = axis
+
+    def forward(self, *tensors):
+        return torch.cat(tensors, dim=self.axis)
+
+
+# ---------------------------------------------------------------------------
 # Batch norm models (used in test_batch_norm.py)
 # ---------------------------------------------------------------------------
 
@@ -237,6 +263,37 @@ class SimplerMNISTClassifier(nn.Module):
         return x
 
 
+class SplitEven(nn.Module):
+    """Split tensor into equal-sized chunks along a given dim."""
+
+    def __init__(self, split_size: int, dim: int = 0):
+        super().__init__()
+        self.split_size = split_size
+        self.dim = dim
+
+    def forward(self, x):
+        chunks = torch.split(x, self.split_size, dim=self.dim)
+        # Sum all chunks so the model has a single tensor output
+        out = chunks[0]
+        for c in chunks[1:]:
+            out = out + c
+        return out
+
+
+class SplitWithSizes(nn.Module):
+    """Split tensor into variable-sized sections along a given dim."""
+
+    def __init__(self, split_sizes, dim: int = 0):
+        super().__init__()
+        self.split_sizes = split_sizes
+        self.dim = dim
+
+    def forward(self, x):
+        chunks = torch.split(x, self.split_sizes, dim=self.dim)
+        # Concatenate back so the model has a single tensor output
+        return torch.cat(chunks, dim=self.dim)
+
+
 class MNISTClassifier(nn.Module):
     """
     Full MNIST classifier:
@@ -259,3 +316,226 @@ class MNISTClassifier(nn.Module):
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         return x
+
+
+# ---------------------------------------------------------------------------
+# Activation function wrappers
+# ---------------------------------------------------------------------------
+
+class SingleGELU(nn.Module):
+    def forward(self, x):
+        return F.gelu(x)
+
+
+class SingleSiLU(nn.Module):
+    def forward(self, x):
+        return F.silu(x)
+
+
+class SingleHardtanh(nn.Module):
+    def forward(self, x):
+        return F.hardtanh(x, min_val=-1.0, max_val=1.0)
+
+
+class SingleClamp(nn.Module):
+    def forward(self, x):
+        return torch.clamp(x, min=-1.0, max=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Elementwise math wrappers
+# ---------------------------------------------------------------------------
+
+class SingleNeg(nn.Module):
+    def forward(self, x):
+        return torch.neg(x)
+
+
+class SingleCos(nn.Module):
+    def forward(self, x):
+        return torch.cos(x)
+
+
+class SingleSin(nn.Module):
+    def forward(self, x):
+        return torch.sin(x)
+
+
+class SinglePowTensor(nn.Module):
+    """aten.pow.Tensor_Scalar — tensor raised to a scalar exponent."""
+    def forward(self, x):
+        return x ** 2
+
+
+# ---------------------------------------------------------------------------
+# Shape manipulation wrappers
+# ---------------------------------------------------------------------------
+
+class SingleUnsqueeze(nn.Module):
+    def __init__(self, dim: int = 1):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        return x.unsqueeze(self.dim)
+
+
+class SingleSqueeze(nn.Module):
+    def __init__(self, dim: int = 1):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        return x.squeeze(self.dim)
+
+
+class SingleCat(nn.Module):
+    def __init__(self, dim: int = 0):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        return torch.cat([x, x], dim=self.dim)
+
+
+class SingleStack(nn.Module):
+    def __init__(self, dim: int = 0):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        return torch.stack([x, x], dim=self.dim)
+
+
+class SingleChunk(nn.Module):
+    def __init__(self, n: int = 3, dim: int = 0):
+        super().__init__()
+        self.n = n
+        self.dim = dim
+
+    def forward(self, x):
+        chunks = torch.chunk(x, self.n, dim=self.dim)
+        out = chunks[0]
+        for c in chunks[1:]:
+            out = out + c
+        return out
+
+
+class SingleUnbind(nn.Module):
+    def __init__(self, dim: int = 0):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        parts = torch.unbind(x, dim=self.dim)
+        out = parts[0]
+        for p in parts[1:]:
+            out = out + p
+        return out
+
+
+class SingleSelect(nn.Module):
+    def __init__(self, dim: int = 0, index: int = 0):
+        super().__init__()
+        self.dim = dim
+        self.index = index
+
+    def forward(self, x):
+        return x.select(self.dim, self.index)
+
+
+class SingleSlice(nn.Module):
+    def forward(self, x):
+        return x[:, 1:3]
+
+
+class SingleExpand(nn.Module):
+    """Input must be shape (1, D); expands to (N, D)."""
+    def __init__(self, n: int = 3):
+        super().__init__()
+        self.n = n
+
+    def forward(self, x):
+        return x.expand(self.n, -1)
+
+
+class SinglePad(nn.Module):
+    def __init__(self, padding=(1, 1)):
+        super().__init__()
+        self.padding = padding
+
+    def forward(self, x):
+        return F.pad(x, self.padding)
+
+
+class SingleTranspose(nn.Module):
+    def __init__(self, dim0: int = 0, dim1: int = 1):
+        super().__init__()
+        self.dim0 = dim0
+        self.dim1 = dim1
+
+    def forward(self, x):
+        return x.transpose(self.dim0, self.dim1)
+
+
+# ---------------------------------------------------------------------------
+# Reduction / pooling wrappers
+# ---------------------------------------------------------------------------
+
+class SingleMeanDim(nn.Module):
+    def __init__(self, dim=-1, keepdim=False):
+        super().__init__()
+        self.dim = dim
+        self.keepdim = keepdim
+
+    def forward(self, x):
+        return x.mean(dim=self.dim, keepdim=self.keepdim)
+
+
+class SingleGlobalAvgPool(nn.Module):
+    def forward(self, x):
+        return F.adaptive_avg_pool2d(x, 1)
+
+
+class SingleGroupNorm(nn.Module):
+    def __init__(self, num_groups: int = 2, num_channels: int = 4):
+        super().__init__()
+        self.gn = nn.GroupNorm(num_groups, num_channels)
+
+    def forward(self, x):
+        return self.gn(x)
+
+
+# ---------------------------------------------------------------------------
+# Constant generation wrappers
+# ---------------------------------------------------------------------------
+
+class AddWithZeros(nn.Module):
+    """Uses aten.zeros.default to create a zero tensor and adds it to x."""
+    def forward(self, x):
+        z = torch.zeros(x.shape[-1])
+        return x + z
+
+
+class AddWithOnes(nn.Module):
+    """Uses aten.ones.default to create an all-ones tensor and adds it to x."""
+    def forward(self, x):
+        o = torch.ones(x.shape[-1])
+        return x + o
+
+
+class AddWithFull(nn.Module):
+    """Uses aten.full.default to create a constant tensor and adds it to x."""
+    def forward(self, x):
+        c = torch.full((x.shape[-1],), 0.5)
+        return x + c
+
+
+# ---------------------------------------------------------------------------
+# Type cast wrappers
+# ---------------------------------------------------------------------------
+
+class CastToFloat16AndBack(nn.Module):
+    """Cast to float16 then back to float32 (exercises _convert_cast)."""
+    def forward(self, x):
+        return x.to(torch.float16).to(torch.float32)

@@ -46,19 +46,53 @@ def assert_export_matches(
     with torch.no_grad():
         expected = model(*example_input) if isinstance(example_input, tuple) else model(example_input)
 
-    compiled_model, exporter = export_model(model, example_input, debug=debug)
+    exporter, ep = export_model(model, example_input, debug=debug)
 
+    # ep.module() runs the exported ATen graph — should match the original model
+    exported_callable = ep.module()
     with torch.no_grad():
-        actual = compiled_model(*example_input) if isinstance(example_input, tuple) else compiled_model(example_input)
+        actual = exported_callable(*example_input) if isinstance(example_input, tuple) else exported_callable(example_input)
 
     if not torch.allclose(expected, actual, rtol=rtol, atol=atol):
         max_diff = torch.max(torch.abs(expected - actual)).item()
         raise AssertionError(
-            f"Compiled output doesn't match PyTorch\n"
+            f"Exported output doesn't match PyTorch\n"
             f"  Max diff: {max_diff:.2e}  (rtol={rtol}, atol={atol})"
         )
 
-    return compiled_model, exporter
+    return exported_callable, exporter
+
+
+def assert_generates_webnn(
+    model: torch.nn.Module,
+    example_input: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    debug: bool = False,
+) -> str:
+    """
+    Export a model and generate its WebNN graph text, returning the text.
+
+    Does NOT require the WebNN runtime — only exercises the generator.
+    Useful for asserting that the generator produces valid output for a given op.
+    """
+    from webnn_torch_export import export_model
+    import tempfile
+    import os
+
+    if not isinstance(example_input, tuple):
+        example_input = (example_input,)
+
+    model.eval()
+    exporter, _ = export_model(model, example_input, debug=debug)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".webnn", delete=False) as f:
+        path = f.name
+    try:
+        exporter.save_to_webnn(path)
+        with open(path) as f:
+            return f.read()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
 
 
 def validate_webnn_execution(
@@ -115,7 +149,7 @@ def validate_webnn_execution(
                 expected_output = model(example_input)
 
         # Export to WebNN with executor
-        executor, exporter = export_model_with_weights(
+        result, ep_or_exporter = export_model_with_weights(
             model,
             example_input,
             webnn_path=webnn_path,
@@ -123,6 +157,8 @@ def validate_webnn_execution(
             debug=debug,
             return_executor=True
         )
+        executor = result
+        exporter = ep_or_exporter
 
         # Verify executor was created
         assert executor is not None, "WebNNExecutor was not created"

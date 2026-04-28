@@ -7,8 +7,6 @@ from .exporter import (
     export_model,
     export_model_with_weights,
     load_weights_from_safetensors,
-    get_custom_backend,
-    get_exporter,
 )
 
 # Optional import - WebNNExecutor requires webnn runtime
@@ -26,7 +24,5 @@ __all__ = [
     "export_model",
     "export_model_with_weights",
     "load_weights_from_safetensors",
-    "get_custom_backend",
-    "get_exporter",
     "WebNNExecutor",  # May be None if webnn not available
 ]
