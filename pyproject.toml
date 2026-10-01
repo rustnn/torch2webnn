@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Custom PyTorch exporter using Dynamo for WebNN"
 readme = "README.md"
 requires-python = ">=3.8"
-license = {text = "Apache License (2.0)"}
+license = "Apache-2"
 authors = [
     {name = "Maximilian Müller", email = "maximilianm@nvidia.com"}
 ]
@@ -16,7 +16,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "License :: OSI Approved :: Apache Software License",
+    "SPDX-License-Identifier: Apache-2",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
@@ -33,11 +33,17 @@ dependencies = [
     "sympy",
 ]
 
+[project.scripts]
+webnn-export = "webnn_torch_export.exporter:main"
+
+[tool.setuptools.packages.find]
+exclude = ["tests", "tests.*"]
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
-    "pywebnn @ git+https://github.com/rustnn/pywebnn.git",
+    "pywebnn @ git+https://github.com/theHamsta/pywebnn.git@fix-filter-options",
 ]
 
 [tool.pytest.ini_options]
