@@ -1,14 +1,14 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "webnn_torch_export"
 version = "0.1.0"
-description = "Custom PyTorch exporter using Dynamo for WebNN"
+description = "Build shape-checked WebNN networks from fixed-size PyTorch models"
 readme = "README.md"
-requires-python = ">=3.8"
-license = "Apache-2"
+requires-python = ">=3.10"
+license = "Apache-2.0"
 authors = [
     {name = "Maximilian Müller", email = "maximilianm@nvidia.com"}
 ]
@@ -16,17 +16,15 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "SPDX-License-Identifier: Apache-2",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "torch>=2.0.0",
+    "torch>=2.6.0",
+    "pywebnn @ git+https://github.com/theHamsta/pywebnn.git@fix-filter-options",
     "safetensors",
     "einops",
     "jinja2",
@@ -37,13 +35,13 @@ dependencies = [
 webnn-export = "webnn_torch_export.exporter:main"
 
 [tool.setuptools.packages.find]
+namespaces = false
 exclude = ["tests", "tests.*"]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
-    "pywebnn @ git+https://github.com/theHamsta/pywebnn.git@fix-filter-options",
 ]
 
 [tool.pytest.ini_options]

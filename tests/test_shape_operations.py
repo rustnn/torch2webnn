@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch._dynamo
 from .models import RearrangeModel, SplitEven, SplitWithSizes
-from .conftest import assert_export_matches, assert_generates_webnn, validate_webnn_execution
+from .conftest import assert_export_matches, assert_builds_webnn, validate_webnn_execution
 
 
 def test_rearrange_export():
@@ -34,9 +34,10 @@ def test_split_even_export(split_size, dim, shape):
     model = SplitEven(split_size, dim)
     x = torch.randn(*shape)
     assert_export_matches(model, x, rtol=1e-5, atol=1e-5)
-    text = assert_generates_webnn(model, x)
-    assert "slice" in text
-    assert "split" not in text
+    exporter = assert_builds_webnn(model, x)
+    operations = [op for _, op, _ in exporter.webnn_generator.checked_shapes]
+    assert "slice" in operations
+    assert "split" not in operations
 
 
 # ---------------------------------------------------------------------------
@@ -53,9 +54,10 @@ def test_split_with_sizes_export(split_sizes, dim, shape):
     model = SplitWithSizes(split_sizes, dim)
     x = torch.randn(*shape)
     assert_export_matches(model, x, rtol=1e-5, atol=1e-5)
-    text = assert_generates_webnn(model, x)
-    assert "slice" in text
-    assert "split" not in text
+    exporter = assert_builds_webnn(model, x)
+    operations = [op for _, op, _ in exporter.webnn_generator.checked_shapes]
+    assert "slice" in operations
+    assert "split" not in operations
 
 
 # ---------------------------------------------------------------------------
