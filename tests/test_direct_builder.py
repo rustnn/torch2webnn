@@ -33,7 +33,7 @@ def test_decompositions_and_casts(model, shape):
     "operation", ["input", "constant", "transpose", "matmul", "add"]
 )
 def test_mismatch_fails_at_operand_creation(operation):
-    context = webnn.ML().create_context(device_type="cpu")
+    context = webnn.ML().create_context()
     calls = []
 
     class BuilderProxy:
@@ -227,7 +227,7 @@ def test_native_text_and_sidecar_roundtrip(tmp_path):
     exporter.save_to_webnn(path)
     assert "@weights(" in path.read_text()
     loaded = webnn.MLGraph.load(str(path))
-    context = webnn.ML().create_context(device_type="cpu", backend="onnx")
+    context = webnn.ML().create_context()
     outputs = context.compute(
         loaded, {exporter.webnn_generator.input_names[0]: x.numpy()}
     )

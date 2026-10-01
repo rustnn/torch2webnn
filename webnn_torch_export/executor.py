@@ -12,7 +12,7 @@ class WebNNExecutor(torch.nn.Module):
         if exporter.context is None:
             import webnn
 
-            exporter.context = webnn.ML().create_context(device_type="cpu")
+            exporter.context = webnn.ML().create_context()
         self.context = exporter.context
         self.webnn_graph = exporter.webnn_graph
         generator = exporter.webnn_generator
