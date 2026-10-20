@@ -29,7 +29,6 @@ Usage:
 import argparse
 import os
 
-import numpy as np
 import torch
 
 from webnn_torch_export import export_model_with_weights
@@ -40,6 +39,7 @@ from _common import hf_login, OUTPUT_DIR
 # ---------------------------------------------------------------------------
 # Wrapper modules
 # ---------------------------------------------------------------------------
+
 
 class EncoderOnly(torch.nn.Module):
     """Wraps the AutoEncoder so only the encode path is exported.
@@ -75,27 +75,18 @@ class DecoderOnly(torch.nn.Module):
 # Export helpers
 # ---------------------------------------------------------------------------
 
+
 def _file_size_kb(path: str) -> float:
     return os.path.getsize(path) / 1024
 
 
-def _validate_webnn(webnn_path: str, weights_path: str, sample_input: torch.Tensor,
-                    torch_output: torch.Tensor) -> None:
-    """Run the exported graph through the WebNN runtime and report MAE."""
-    try:
-        import webnn
-        context = webnn.ML().create_context(device_type="auto")
-        graph = webnn.MLGraph.load(webnn_path, weights_path=weights_path)
-        input_name = graph.get_input_names()[0]
-        output_name = graph.get_output_names()[0]
-        webnn_out = context.compute(
-            graph,
-            {input_name: sample_input.detach().cpu().numpy().astype(np.float32)},
-        )[output_name]
-        mae = float(np.mean(np.abs(webnn_out - torch_output.detach().cpu().numpy())))
-        print(f"    WebNN vs Torch MAE: {mae:.6f}")
-    except ImportError:
-        print("    webnn package not available — skipping runtime validation.")
+def _validate_webnn(
+    exporter, sample_input: torch.Tensor, torch_output: torch.Tensor
+) -> None:
+    """Execute the directly built graph and report MAE."""
+    webnn_out = exporter.to_executor()(sample_input)
+    mae = (webnn_out - torch_output.detach().cpu()).abs().mean().item()
+    print(f"    WebNN vs Torch MAE: {mae:.6f}")
 
 
 def export_encoder(autoencoder, sample_image: torch.Tensor) -> None:
@@ -108,11 +99,11 @@ def export_encoder(autoencoder, sample_image: torch.Tensor) -> None:
 
     encoder_model = EncoderOnly(autoencoder)
 
-    webnn_path   = os.path.join(OUTPUT_DIR, "flux_klein_encoder.webnn")
+    webnn_path = os.path.join(OUTPUT_DIR, "flux_klein_encoder.webnn")
     weights_path = os.path.join(OUTPUT_DIR, "flux_klein_encoder_weights.safetensors")
 
     try:
-        export_model_with_weights(
+        exporter, _ = export_model_with_weights(
             model=encoder_model,
             example_input=sample_image,
             webnn_path=webnn_path,
@@ -121,11 +112,12 @@ def export_encoder(autoencoder, sample_image: torch.Tensor) -> None:
         )
         print(f"  Graph  : {webnn_path}  ({_file_size_kb(webnn_path):.1f} KB)")
         print(f"  Weights: {weights_path}  ({_file_size_kb(weights_path):.1f} KB)")
-        _validate_webnn(webnn_path, weights_path, sample_image, torch_latent)
+        _validate_webnn(exporter, sample_image, torch_latent)
     except NotImplementedError as e:
         print(f"  Unsupported operation: {e}")
     except Exception as e:
         import traceback
+
         print(f"  Export error: {e}")
         traceback.print_exc()
 
@@ -140,11 +132,11 @@ def export_decoder(autoencoder, sample_latent: torch.Tensor) -> None:
 
     decoder_model = DecoderOnly(autoencoder)
 
-    webnn_path   = os.path.join(OUTPUT_DIR, "flux_klein_decoder.webnn")
+    webnn_path = os.path.join(OUTPUT_DIR, "flux_klein_decoder.webnn")
     weights_path = os.path.join(OUTPUT_DIR, "flux_klein_decoder_weights.safetensors")
 
     try:
-        export_model_with_weights(
+        exporter, _ = export_model_with_weights(
             model=decoder_model,
             example_input=sample_latent,
             webnn_path=webnn_path,
@@ -153,11 +145,12 @@ def export_decoder(autoencoder, sample_latent: torch.Tensor) -> None:
         )
         print(f"  Graph  : {webnn_path}  ({_file_size_kb(webnn_path):.1f} KB)")
         print(f"  Weights: {weights_path}  ({_file_size_kb(weights_path):.1f} KB)")
-        _validate_webnn(webnn_path, weights_path, sample_latent, torch_image)
+        _validate_webnn(exporter, sample_latent, torch_image)
     except NotImplementedError as e:
         print(f"  Unsupported operation: {e}")
     except Exception as e:
         import traceback
+
         print(f"  Export error: {e}")
         traceback.print_exc()
 
@@ -165,6 +158,7 @@ def export_decoder(autoencoder, sample_latent: torch.Tensor) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main(mode: str = "both") -> None:
     hf_login()
@@ -182,6 +176,7 @@ def main(mode: str = "both") -> None:
     except SystemExit:
         print("Could not load weights from HuggingFace — using placeholder model.")
         from flux2.autoencoder import AutoEncoder, AutoEncoderParams
+
         with torch.device("cpu"):
             autoencoder = AutoEncoder(AutoEncoderParams())
         autoencoder.eval()
@@ -191,8 +186,8 @@ def main(mode: str = "both") -> None:
     print(f"  Size (fp32): ~{n_params * 4 / 1024**2:.1f} MB")
 
     # Canonical shapes from ARCHITECTURE.md
-    sample_image  = torch.randn(1, 3, 512, 512)   # RGB image
-    sample_latent = torch.randn(1, 128, 32, 32)   # 16× compressed latent
+    sample_image = torch.randn(1, 3, 512, 512)  # RGB image
+    sample_latent = torch.randn(1, 128, 32, 32)  # 16× compressed latent
 
     if mode in ("encoder", "both"):
         export_encoder(autoencoder, sample_image)
@@ -204,7 +199,9 @@ def main(mode: str = "both") -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Export Flux Klein AutoEncoder to WebNN")
+    parser = argparse.ArgumentParser(
+        description="Export Flux Klein AutoEncoder to WebNN"
+    )
     parser.add_argument(
         "--mode",
         choices=["encoder", "decoder", "both"],

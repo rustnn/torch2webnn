@@ -1,107 +1,96 @@
-"""
-PyTorch → WebNN exporter using torch.export (ATen IR).
+"""Export fixed-size PyTorch models directly into pywebnn networks."""
 
-Public API:
-    export_model(model, example_input)              → (compiled_model, exporter)
-    export_model_with_weights(model, example_input, webnn_path, weights_path)
-"""
+from typing import Tuple, Union
+from pathlib import Path
+import shutil
 
 import torch
 import torch.export
-from typing import Union, Tuple
-from safetensors.torch import save_file, load_file
+from safetensors.torch import load_file, save_file
 
 from .webnn_generator import WebNNGraphGenerator
 
 
 class CustomExporter:
-    """
-    Wraps a torch.export.ExportedProgram and converts it to the WebNN graph format.
-    """
+    """An exported ATen program and its shape-checked, in-memory WebNN graph."""
 
-    def __init__(self, ep: torch.export.ExportedProgram, debug: bool = False):
+    def __init__(
+        self, ep: torch.export.ExportedProgram, debug: bool = False, context=None
+    ):
         self.ep = ep
         self.debug = debug
-        self.webnn_generator = WebNNGraphGenerator()
-        # Compatibility: expose graph nodes in the same dict format as the old Dynamo backend
+        self.webnn_generator = WebNNGraphGenerator(context=context)
+        self.context = self.webnn_generator.context
         self.exported_graphs = [self._graph_to_dict(ep.graph_module)]
-
         if debug:
-            print("\n" + "=" * 80)
-            print("EXPORTED PROGRAM")
-            print("=" * 80)
             ep.graph.print_tabular()
-
-    # ------------------------------------------------------------------
-    # Compatibility helpers
-    # ------------------------------------------------------------------
+        self.webnn_graph = self.webnn_generator.generate(ep)
 
     @staticmethod
     def _graph_to_dict(gm: torch.fx.GraphModule) -> dict:
-        """Return graph nodes in the same dict format as the old Dynamo-based exporter."""
-        nodes = []
-        for node in gm.graph.nodes:
-            nodes.append({
-                "name": node.name,
-                "op": node.op,
-                "target": str(node.target),
-                "args": [str(a) for a in node.args],
-                "kwargs": {k: str(v) for k, v in node.kwargs.items()},
-            })
-        return {"nodes": nodes, "graph_str": str(gm.graph)}
+        return {
+            "nodes": [
+                {
+                    "name": n.name,
+                    "op": n.op,
+                    "target": str(n.target),
+                    "args": [str(a) for a in n.args],
+                    "kwargs": {k: str(v) for k, v in n.kwargs.items()},
+                }
+                for n in gm.graph.nodes
+            ],
+            "graph_str": str(gm.graph),
+        }
 
-    # ------------------------------------------------------------------
-    # WebNN / weights serialisation
-    # ------------------------------------------------------------------
+    def to_executor(self):
+        """Wrap the constructed network in a PyTorch-like callable."""
+        from .executor import WebNNExecutor
+
+        return WebNNExecutor(self)
+
+    def to_webnn_text(self) -> str:
+        """Return RustNN's debug text for the constructed graph (inline constants)."""
+        generator = self.webnn_generator
+        return generator.builder.rustnn_webnn_text_for_outputs(generator.outputs)
 
     def save_to_webnn(self, filepath: str, graph_name: str = "model") -> None:
-        """Write the WebNN graph text file."""
-        webnn_graph = self.webnn_generator.generate(self.ep, graph_name=graph_name)
-        with open(filepath, "w") as f:
-            f.write(webnn_graph)
+        """Delegate text and sibling .safetensors serialization to RustNN.
+
+        graph_name is accepted for source compatibility; RustNN controls the header.
+        """
+        generator = self.webnn_generator
+        generator.builder.rustnn_save_webnn(generator.outputs, filepath)
 
     def save_weights(self, filepath: str) -> None:
-        """
-        Save model parameters and buffers to a safetensors file.
-
-        Keys match the state_dict paths referenced in @weights(...) inside the
-        .webnn file (e.g. "conv1.weight", "bn.running_mean").
-        """
+        """Optionally save a separate copy of the original parameters and buffers."""
         state_dict = {
             **dict(self.ep.named_parameters()),
             **dict(self.ep.named_buffers()),
         }
-        save_file(state_dict, filepath)
+        save_file(
+            {k: v.detach().cpu().contiguous() for k, v in state_dict.items()},
+            str(filepath),
+        )
 
-
-# ---------------------------------------------------------------------------
-# High-level helpers
-# ---------------------------------------------------------------------------
 
 def export_model(
     model: torch.nn.Module,
     example_input: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
     debug: bool = False,
-) -> Tuple["CustomExporter", torch.export.ExportedProgram]:
-    """
-    Export a model to ATen IR using torch.export.
+    *,
+    context=None,
+) -> Tuple[CustomExporter, torch.export.ExportedProgram]:
+    """Build a static WebNN network and check every operand's PyTorch shape.
 
-    Args:
-        model: The PyTorch model.
-        example_input: A single tensor or tuple of tensors.
-        debug: Print the exported graph.
-
-    Returns:
-        (exporter, exported_program)
+    Returns (exporter, exported_program). Use exporter.to_executor() for inference.
+    Construction needs no runtime. An optional pywebnn context selects a backend/device.
+    The model's training/evaluation mode is respected; use model.eval() for inference.
     """
     if not isinstance(example_input, tuple):
         example_input = (example_input,)
-
     with torch.no_grad():
         ep = torch.export.export(model, example_input)
-
-    exporter = CustomExporter(ep, debug=debug)
-    return exporter, ep
+    return CustomExporter(ep, debug=debug, context=context), ep
 
 
 def export_model_with_weights(
@@ -112,45 +101,41 @@ def export_model_with_weights(
     debug: bool = False,
     graph_name: str = "model",
     return_executor: bool = False,
+    *,
+    context=None,
 ):
-    """
-    Export model to WebNN format and save weights.
+    """Build directly, then save RustNN text and its external constant weights.
 
-    Args:
-        model: The PyTorch model.
-        example_input: Example input tensor(s).
-        webnn_path: Path to write the .webnn graph file.
-        weights_path: Path to write the .safetensors weights file.
-        debug: Print the exported graph.
-        graph_name: Name embedded in the .webnn file header.
-        return_executor: If True, returns a WebNNExecutor.
-
-    Returns:
-        If return_executor=False: (exporter, exported_program)
-        If return_executor=True:  (webnn_executor, exported_program)
+    This compatibility helper uses the RustNN saver exposed by pywebnn. Execution uses the
+    already-built network, with no file parsing or graph reload.
     """
-    exporter, ep = export_model(model, example_input, debug=debug)
+    exporter, ep = export_model(model, example_input, debug=debug, context=context)
     exporter.save_to_webnn(webnn_path, graph_name=graph_name)
-    exporter.save_weights(weights_path)
-
-    if return_executor:
-        from .executor import WebNNExecutor
-        try:
-            executor = WebNNExecutor(webnn_path, weights_path, example_input)
-            return executor, ep
-        except ImportError as e:
-            print(f"Warning: WebNN runtime not available: {e}")
-            return exporter, ep
-
-    return exporter, ep
+    sidecar = Path(webnn_path).with_suffix(".safetensors")
+    if sidecar.resolve() != Path(weights_path).resolve():
+        shutil.copyfile(sidecar, weights_path)
+    return (exporter.to_executor() if return_executor else exporter), ep
 
 
 def load_weights_from_safetensors(
     model: torch.nn.Module, filepath: str, strict: bool = True
-) -> torch.nn.Module:
-    """Load weights from a safetensors file into a model."""
-    state_dict = load_file(filepath)
-    model.load_state_dict(state_dict, strict=strict)
-    total = sum(p.numel() for p in state_dict.values())
-    print(f"Loaded {total:,} parameters from {filepath}")
+):
+    """Load a weights snapshot into a PyTorch model."""
+    model.load_state_dict(load_file(filepath), strict=strict)
     return model
+
+
+def main():
+    """Build a pywebnn network from a saved torch.export program (.pt2)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("program", help="Fixed-size torch.export program (.pt2)")
+    parser.add_argument(
+        "output", help="Destination for pywebnn native graph serialization"
+    )
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+    CustomExporter(torch.export.load(args.program), debug=args.debug).save_to_webnn(
+        args.output
+    )

@@ -1,1645 +1,792 @@
-"""
-WebNN Graph Generator - Converts PyTorch ExportedProgram (ATen IR) to WebNN format.
+"""Build fixed-size pywebnn networks from torch.export ATen graphs.
 
-Entry point: WebNNGraphGenerator().generate(ep, graph_name)
-where ep is a torch.export.ExportedProgram.
+Every builder result is checked against a PyTorch meta tensor immediately, including
+intermediate operands introduced by decompositions. FX results are also checked
+against torch.export metadata before subsequent nodes can use them.
 """
 
+from dataclasses import dataclass
 import math
-import sys
+import operator
+
 import torch
 import torch.fx as fx
-import torch.export
-from typing import Dict, List, Optional, Tuple
+import torch.nn.functional as F
+import webnn
+from torch.utils import _pytree
 
 from .webnn_op_mappings import resolve_aten_converter
 
 
-def isnumeric(obj):
+class ShapeMismatchError(ValueError):
+    """PyTorch and pywebnn inferred different shapes for an operand."""
+
+
+@dataclass
+class CheckedOperand:
+    operand: object
+    tensor: torch.Tensor
+
+
+DTYPES = {
+    torch.float32: "float32",
+    torch.float16: "float16",
+    torch.int32: "int32",
+    torch.int64: "int64",
+    torch.int8: "int8",
+    torch.uint8: "uint8",
+    torch.uint32: "uint32",
+    torch.uint64: "uint64",
+}
+
+
+def fixed_shape(tensor):
+    shape = tuple(tensor.shape)
+    if any(type(d) is not int or d <= 0 for d in shape):
+        raise ValueError(
+            f"Only fixed, positive tensor dimensions are supported; got {shape}"
+        )
+    return shape
+
+
+def webnn_dtype(dtype):
     try:
-        obj + 0
-        return True
-    except TypeError:
-        return False
-
-
-def throw_unsupported(kind, node):
-    msg = (
-        f"\n{'=' * 80}\n"
-        f"UNSUPPORTED {kind}\n"
-        f"{'=' * 80}\n"
-        f"Node : {node.name}\n"
-        f"Target: {node.target}\n"
-        f"Args  : {[str(a) for a in node.args]}\n"
-        f"Kwargs: {node.kwargs}\n"
-        f"{'=' * 80}\n"
-    )
-    raise NotImplementedError(msg)
+        return DTYPES[dtype]
+    except KeyError:
+        raise NotImplementedError(f"Unsupported WebNN dtype: {dtype}") from None
 
 
 class WebNNGraphGenerator:
-    """Generates WebNN graph format from a torch.export.ExportedProgram."""
+    """Construct an in-memory network; no graph text or parser is involved."""
 
-    def __init__(self):
-        self.operand_counter = 1
-        self.node_to_operand: Dict[str, str] = {}
-        # Maps FX placeholder node name → operand name (for parameters/buffers)
-        self.weight_operands: Dict[str, str] = {}
-        self.operand_shapes: Dict[str, List[int]] = {}
-        self.inline_constants: Dict[str, object] = {}
-        # Maps multi-output node name → list of per-output operand names (chunk/unbind/split)
-        self.multi_output_operands: Dict[str, List[str]] = {}
-
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
-
-    def generate(
-        self,
-        ep: torch.export.ExportedProgram,
-        graph_name: str = "model",
-    ) -> str:
-        """Generate WebNN graph format from an ExportedProgram.
-
-        Args:
-            ep: Result of torch.export.export(model, example_inputs).
-            graph_name: Name embedded in the .webnn file header.
-
-        Returns:
-            WebNN graph as a string.
-        """
-        # Reset state
-        self.operand_counter = 1
+    def __init__(self, context=None):
+        self.context = context
+        self.builder = None
+        self.node = None
+        self.checked_shapes = []
+        self.input_names = []
+        self.input_specs = {}
+        self.output_names = []
+        self.output_specs = {}
         self.node_to_operand = {}
-        self.weight_operands = {}
-        self.operand_shapes = {}
-        self.inline_constants = {}
-        self.multi_output_operands = {}
 
-        gm = ep.graph_module
+    def _check(self, operand, tensor, operation):
+        expected = fixed_shape(tensor)
+        actual = tuple(operand.shape)
+        label = self.node.name if self.node is not None else "graph"
+        if actual != expected:
+            raise ShapeMismatchError(
+                f"{label} ({operation}): PyTorch shape {expected} != pywebnn shape {actual}"
+            )
+        self.checked_shapes.append((label, operation, expected))
+        return CheckedOperand(
+            operand, torch.empty(expected, dtype=tensor.dtype, device="meta")
+        )
+
+    def _emit(self, operation, reference, *args, **options):
+        def unwrap(value, attr):
+            return _pytree.tree_map(
+                lambda x: getattr(x, attr) if isinstance(x, CheckedOperand) else x,
+                value,
+            )
+
+        # PyTorch independently infers the expected intermediate shape.
+        expected = reference(*unwrap(args, "tensor"))
+        operand = getattr(self.builder, operation)(
+            *unwrap(args, "operand"), **unwrap(options, "operand")
+        )
+        return self._check(operand, expected, operation)
+
+    def _constant(self, tensor):
+        tensor = tensor.detach().cpu().contiguous()
+        fixed_shape(tensor)
+        dtype = webnn_dtype(tensor.dtype)
+        operand = self.builder.constant(tensor.numpy(), data_type=dtype)
+        return self._check(operand, tensor, "constant")
+
+    def _scalar(self, value, like):
+        return self._constant(
+            torch.tensor(value, dtype=torch.result_type(like.tensor, value))
+        )
+
+    def _binary(self, name, a, b):
+        if not isinstance(a, CheckedOperand):
+            a = self._scalar(a, b)
+        if not isinstance(b, CheckedOperand):
+            b = self._scalar(b, a)
+        if a.tensor.dtype != b.tensor.dtype:
+            dtype = torch.promote_types(a.tensor.dtype, b.tensor.dtype)
+            a, b = self._cast(a, dtype), self._cast(b, dtype)
+        return self._emit(name, getattr(torch, name), a, b)
+
+    def _cast(self, x, dtype):
+        if x.tensor.dtype == dtype:
+            return x
+        return self._emit(
+            "cast", lambda t: t.to(dtype), x, data_type=webnn_dtype(dtype)
+        )
+
+    def _reshape(self, x, shape):
+        # Resolve -1 through PyTorch, then pass only fixed dimensions to WebNN.
+        resolved = list(x.tensor.reshape(shape).shape)
+        return self._emit("reshape", lambda t: t.reshape(shape), x, new_shape=resolved)
+
+    def _transpose(self, x, permutation):
+        return self._emit(
+            "transpose",
+            lambda t: t.permute(permutation),
+            x,
+            permutation=list(permutation),
+        )
+
+    def _matmul(self, a, b):
+        expected = torch.matmul(a.tensor, b.tensor).shape
+        a_vec, b_vec = a.tensor.ndim == 1, b.tensor.ndim == 1
+        if a_vec:
+            a = self._reshape(a, [1, a.tensor.shape[0]])
+        if b_vec:
+            b = self._reshape(b, [b.tensor.shape[0], 1])
+        result = self._emit("matmul", torch.matmul, a, b)
+        return self._reshape(result, expected) if a_vec or b_vec else result
+
+    def _mean(self, x, axes, keep=True):
+        axes = list(range(x.tensor.ndim)) if axes is None else list(axes)
+        axes = [axis % x.tensor.ndim for axis in axes]
+        return self._emit(
+            "reduce_mean",
+            lambda t: t.mean(tuple(axes), keepdim=keep),
+            x,
+            axes=axes,
+            keep_dimensions=keep,
+        )
+
+    def _normalize(self, x, axes, eps):
+        centered = self._binary("sub", x, self._mean(x, axes))
+        variance = self._mean(self._binary("mul", centered, centered), axes)
+        std = self._emit("sqrt", torch.sqrt, self._binary("add", variance, eps))
+        return self._binary("div", centered, std)
+
+    def _affine(self, x, weight, bias, shape=None):
+        if weight is not None:
+            x = self._binary(
+                "mul", x, self._reshape(weight, shape) if shape else weight
+            )
+        if bias is not None:
+            x = self._binary("add", x, self._reshape(bias, shape) if shape else bias)
+        return x
+
+    def generate(self, ep, graph_name="model"):
+        """Return an MLGraph with embedded constants and checked static operands."""
+        if ep.range_constraints:
+            raise ValueError(
+                "Dynamic shapes are unsupported; export with fixed example inputs"
+            )
+        self.builder = (
+            self.context.create_graph_builder()
+            if self.context is not None
+            else webnn.MLGraphBuilder.new_uncompiled()
+        )
+        self.checked_shapes = []
+        self.input_names, self.output_names = [], []
+        self.input_specs, self.node_to_operand, self.output_specs = {}, {}, {}
         sig = ep.graph_signature
+        if sig.buffers_to_mutate or sig.user_inputs_to_mutate:
+            raise NotImplementedError(
+                "Graphs with input or buffer mutations are unsupported"
+            )
+        constants = {**ep.state_dict, **ep.constants}
+        from torch.export.graph_signature import ConstantArgument, InputKind
 
-        # Set of placeholder names that are actual model inputs (not weights)
-        user_inputs: set = set(sig.user_inputs)
-
-        # Mapping: placeholder_node_name → state_dict key
-        param_map: Dict[str, str] = {
+        user_specs = [
+            spec for spec in sig.input_specs if spec.kind == InputKind.USER_INPUT
+        ]
+        user_names = {spec.arg.name for spec in user_specs}
+        self.scalar_inputs = {
+            i: spec.arg.value
+            for i, spec in enumerate(user_specs)
+            if isinstance(spec.arg, ConstantArgument)
+        }
+        targets = {
             **sig.inputs_to_parameters,
             **sig.inputs_to_buffers,
+            **sig.inputs_to_lifted_tensor_constants,
         }
-
-        # Named tensors for weight shape/dtype lookup
-        named_params: Dict[str, torch.Tensor] = {
-            **dict(ep.named_parameters()),
-            **dict(ep.named_buffers()),
-        }
-
-        # Build sections
-        inputs_section = self._extract_inputs(gm, user_inputs)
-        consts_section = self._extract_weights(gm, param_map, named_params)
-        nodes_section = self._convert_nodes(gm)
-        inline_consts_section = self._extract_inline_constants()
-        outputs_section = self._extract_outputs(gm)
-
-        all_consts = ""
-        if inline_consts_section:
-            all_consts += inline_consts_section
-        if consts_section:
-            all_consts += consts_section
-
-        graph = f'webnn_graph "{graph_name}" v1 {{\n'
-        graph += f"  inputs {{ {inputs_section} }}\n"
-        if all_consts:
-            graph += f"  consts {{\n{all_consts}  }}\n"
-        graph += f"  nodes {{\n{nodes_section}  }}\n"
-        graph += f"  outputs {{ {outputs_section} }}\n"
-        graph += "}\n"
-
-        return graph
-
-    # ------------------------------------------------------------------
-    # Input / weight extraction
-    # ------------------------------------------------------------------
-
-    def _extract_inputs(
-        self, gm: fx.GraphModule, user_inputs: set
-    ) -> str:
-        """Emit `inputs {}` section — only real model inputs, not parameters."""
-        decls = []
-        for node in gm.graph.nodes:
-            if node.op != "placeholder":
-                continue
-            if node.name not in user_inputs:
-                continue
-
-            shape = self._get_node_shape(node)
-            dtype = self._get_webnn_dtype(self._get_node_dtype(node))
-            shape_str = ", ".join(map(str, shape))
-            # Use the parameter name from the graph signature (strip trailing '_')
-            name = node.name.rstrip("_")
-            self.node_to_operand[node.name] = name
-            decls.append(f"{name}: {dtype}[{shape_str}]")
-
-        return "; ".join(decls) + ";" if decls else ""
-
-    def _extract_weights(
-        self,
-        gm: fx.GraphModule,
-        param_map: Dict[str, str],
-        named_params: Dict[str, torch.Tensor],
-    ) -> str:
-        """Emit `consts {}` section for model parameters and buffers."""
-        consts = []
-        for node in gm.graph.nodes:
-            if node.op != "placeholder":
-                continue
-            if node.name not in param_map:
-                continue
-
-            state_key = param_map[node.name]
-            tensor = named_params.get(state_key)
-            if tensor is None:
-                continue
-
-            operand_name = f"weight_{self.operand_counter}"
-            self.operand_counter += 1
-
-            shape = list(tensor.shape)
-            dtype = self._get_webnn_dtype(tensor.dtype)
-            shape_str = ", ".join(map(str, shape))
-
-            self.weight_operands[node.name] = operand_name
-            self.operand_shapes[operand_name] = shape
-
-            consts.append(
-                f'\t{operand_name}: {dtype}[{shape_str}] @weights("{state_key}");'
-            )
-
-        return "\n".join(consts) + "\n" if consts else ""
-
-    # ------------------------------------------------------------------
-    # Node conversion
-    # ------------------------------------------------------------------
-
-    def _convert_nodes(self, gm: fx.GraphModule) -> str:
-        """Convert all call_function nodes to WebNN operations."""
-        operations = []
-        for node in gm.graph.nodes:
-            if node.op != "call_function":
-                continue
-            try:
-                op_str = self._map_aten_to_webnn_op(node)
-                if op_str:
-                    operations.append(f"\t{op_str}")
-            except NotImplementedError as e:
-                input_operands = [
-                    self._get_input_operand(a)
-                    for a in node.args
-                    if isinstance(a, fx.Node)
-                ]
-                operations.append(
-                    f"\t// unsupported: {node.target} "
-                    f"inputs=[{', '.join(input_operands)}] args={list(node.args)}"
+        for node in ep.graph.nodes:
+            self.node = node
+            if node.op == "placeholder":
+                if node.name in targets:
+                    result = self._constant(constants[targets[node.name]])
+                elif node.name in user_names:
+                    value = node.meta.get("val")
+                    if not isinstance(value, torch.Tensor):
+                        # Non-tensor arguments are specialized by torch.export.
+                        result = value
+                    else:
+                        shape = fixed_shape(value)
+                        name = node.name
+                        operand = self.builder.input(
+                            name, list(shape), webnn_dtype(value.dtype)
+                        )
+                        result = self._check(operand, value, "input")
+                        self.input_names.append(name)
+                        self.input_specs[name] = (shape, value.dtype)
+                else:
+                    raise NotImplementedError(f"Unsupported placeholder {node.name}")
+            elif node.op == "call_function":
+                result = self._convert(node)
+                self._check_result(result, node.meta.get("val"))
+            elif node.op == "get_attr":
+                result = self._constant(getattr(ep.graph_module, node.target))
+            elif node.op == "output":
+                leaves, _ = _pytree.tree_flatten(self._resolve(node.args[0]))
+                outputs = {}
+                for i, leaf in enumerate(leaves):
+                    if not isinstance(leaf, CheckedOperand):
+                        raise NotImplementedError("Only tensor outputs are supported")
+                    name = f"output_{i}"
+                    # Distinct output operands preserve duplicate outputs and aliases.
+                    result = self._emit("identity", lambda t: t, leaf)
+                    outputs[name] = result.operand
+                    self.output_names.append(name)
+                    self.output_specs[name] = (
+                        tuple(result.tensor.shape),
+                        result.tensor.dtype,
+                    )
+                self.node = None
+                self.outputs = outputs
+                return self.builder.build(outputs)
+            else:
+                raise NotImplementedError(
+                    f"Unsupported FX node: {node.op} ({node.name})"
                 )
+            self.node_to_operand[node.name] = result
+        raise ValueError("Exported graph has no outputs")
 
-        return "\n".join(operations) + "\n" if operations else ""
+    def _resolve(self, value):
+        return _pytree.tree_map(
+            lambda x: self.node_to_operand[x.name] if isinstance(x, fx.Node) else x,
+            value,
+        )
 
-    def _map_aten_to_webnn_op(self, node: fx.Node) -> str:
-        output = self._get_operand_name(node)
-        inputs = [
-            self._get_input_operand(a)
-            for a in node.args
-            if isinstance(a, fx.Node)
-        ]
+    def _check_result(self, result, expected):
+        if isinstance(result, CheckedOperand):
+            if not isinstance(expected, torch.Tensor):
+                raise ValueError(
+                    f"Missing PyTorch tensor metadata for {self.node.name}"
+                )
+            self._check(result.operand, expected, str(self.node.target))
+        elif isinstance(result, (tuple, list)):
+            if not isinstance(expected, (tuple, list)) or len(result) != len(expected):
+                raise ValueError(f"Output structure mismatch at {self.node.name}")
+            for item, value in zip(result, expected):
+                if item is not None:
+                    self._check_result(item, value)
 
-        method_name = resolve_aten_converter(node.target)
-        if method_name is None:
-            throw_unsupported("ATen op", node)
-
-        method = getattr(self, method_name)
-        return method(node, output, inputs)
-
-    # ------------------------------------------------------------------
-    # Converter methods — each takes (node, output_operand, input_operands)
-    # ------------------------------------------------------------------
-
-    # --- Convolution ---
-
-    def _emit_conv2d(
-        self, input_tensor, weight, bias_info, stride, padding, dilation, groups, output
-    ) -> str:
-        def as_pair(v):
-            return list(v) if isinstance(v, (list, tuple)) else [v, v]
-
-        stride = as_pair(stride)
-        padding = as_pair(padding)
-        dilation = as_pair(dilation)
-
-        params = []
-        if dilation != [1, 1]:
-            params.append(f"dilations=[{dilation[0]}, {dilation[1]}]")
-        params.append('filterLayout="oihw"')
-        params.append(f"groups={groups}")
-        params.append('inputLayout="nchw"')
-        if padding != [0, 0]:
-            params.append(f"padding=[{padding[0]}, {padding[0]}, {padding[1]}, {padding[1]}]")
-        if stride != [1, 1]:
-            params.append(f"strides=[{stride[0]}, {stride[1]}]")
-
-        params_str = ", ".join(params)
-
-        if bias_info is not None:
-            bias_operand, c = bias_info
-            reshaped_bias = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            conv_out = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            return (
-                f"[{reshaped_bias}] = reshape({bias_operand}, newShape=[1, {c}, 1, 1]);\n"
-                f"\t[{conv_out}] = conv2d({input_tensor}, {weight}, {params_str});\n"
-                f"\t[{output}] = add({conv_out}, {reshaped_bias});"
+    def _convert(self, node):
+        converter = resolve_aten_converter(node.target)
+        if converter is None:
+            raise NotImplementedError(
+                f"Unsupported ATen operation at {node.name}: {node.target}"
             )
-        return f"[{output}] = conv2d({input_tensor}, {weight}, {params_str});"
+        args = self._resolve(node.args)
+        kwargs = self._resolve(node.kwargs)
+        return getattr(self, converter)(node, args, kwargs)
 
-    def _convert_conv2d(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.conv2d.default(input, weight, bias, stride, padding, dilation, groups)"""
-        args = node.args
-        input_tensor = inputs[0] if inputs else "unknown"
-        weight = self._get_input_operand(args[1]) if len(args) > 1 else "unknown"
+    def _unary(self, node, args, kwargs):
+        name = str(node.target).split(".")[1].rstrip("_")
+        return self._emit(name, getattr(torch, name), args[0])
 
+    def _arithmetic(self, node, args, kwargs):
+        name = str(node.target).split(".")[1].rstrip("_")
+        a, b = args[:2]
+        alpha = kwargs.get("alpha", 1)
+        if name in ("add", "sub") and alpha != 1:
+            b = (
+                self._binary("mul", b, alpha)
+                if isinstance(b, CheckedOperand)
+                else b * alpha
+            )
+        if name == "div" and kwargs.get("rounding_mode") is not None:
+            raise NotImplementedError("Integer/rounded division is unsupported")
+        return self._binary(name, a, b)
+
+    def _activation(self, node, args, kwargs):
+        name = str(node.target).split(".")[1].rstrip("_")
+        x = args[0]
+        if name == "silu":
+            return self._binary("mul", x, self._emit("sigmoid", torch.sigmoid, x))
+        if name == "rsqrt":
+            return self._emit(
+                "reciprocal", torch.reciprocal, self._emit("sqrt", torch.sqrt, x)
+            )
+        if name == "gelu":
+            approximate = (
+                args[1] if len(args) > 1 else kwargs.get("approximate", "none")
+            )
+            if approximate == "none":
+                return self._emit("gelu", F.gelu, x)
+            if approximate != "tanh":
+                raise NotImplementedError(
+                    f"Unsupported GELU approximation: {approximate}"
+                )
+            cube = self._binary("pow", x, 3)
+            inner = self._binary(
+                "mul",
+                self._binary("add", x, self._binary("mul", cube, 0.044715)),
+                math.sqrt(2 / math.pi),
+            )
+            return self._binary(
+                "mul",
+                self._binary("mul", x, 0.5),
+                self._binary("add", self._emit("tanh", torch.tanh, inner), 1),
+            )
+        low = args[1] if len(args) > 1 else kwargs.get("min")
+        high = args[2] if len(args) > 2 else kwargs.get("max")
+        if name == "hardtanh":
+            low, high = (
+                (args[1] if len(args) > 1 else -1),
+                (args[2] if len(args) > 2 else 1),
+            )
+        return self._emit(
+            "clamp",
+            lambda t: torch.clamp(t, min=low, max=high),
+            x,
+            min_value=low,
+            max_value=high,
+        )
+
+    def _linear(self, node, args, kwargs):
+        name = str(node.target).split(".")[1]
+        if name == "linear":
+            x, weight = args[:2]
+            out = self._matmul(x, self._transpose(weight, [1, 0]))
+            return (
+                self._binary("add", out, args[2])
+                if len(args) > 2 and args[2] is not None
+                else out
+            )
+        if name == "addmm":
+            bias, a, b = args[:3]
+            out = self._matmul(a, b)
+            alpha, beta = kwargs.get("alpha", 1), kwargs.get("beta", 1)
+            if alpha != 1:
+                out = self._binary("mul", out, alpha)
+            if beta == 0:
+                return out
+            return self._binary(
+                "add", out, self._binary("mul", bias, beta) if beta != 1 else bias
+            )
+        return self._matmul(*args[:2])
+
+    def _conv(self, node, args, kwargs):
+        x, weight = args[:2]
+        bias = args[2] if len(args) > 2 else None
         stride = args[3] if len(args) > 3 else [1, 1]
         padding = args[4] if len(args) > 4 else [0, 0]
         dilation = args[5] if len(args) > 5 else [1, 1]
         groups = args[6] if len(args) > 6 else 1
-
-        bias_info = None
-        bias_node = args[2] if len(args) > 2 else None
-        if isinstance(bias_node, fx.Node):
-            bias_operand = self._get_input_operand(bias_node)
-            bias_shape = self.operand_shapes.get(bias_operand, [])
-            bias_info = (bias_operand, bias_shape[0] if bias_shape else 0)
-
-        return self._emit_conv2d(input_tensor, weight, bias_info, stride, padding, dilation, groups, output)
-    
-    # --- Linear ---
-
-    def _convert_linear(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.linear.default(input, weight, bias)"""
-        if len(inputs) < 2:
-            raise NotImplementedError("linear requires at least 2 inputs")
-        input_tensor, weight = inputs[0], inputs[1]
-
-        weight_t = f"operand_{self.operand_counter}"
-        self.operand_counter += 1
-        mm_out = f"operand_{self.operand_counter}"
-        self.operand_counter += 1
-
-        stmts = [
-            f"[{weight_t}] = transpose({weight}, permutation=[1, 0]);",
-            f"[{mm_out}] = matmul({input_tensor}, {weight_t});",
-        ]
-        if len(inputs) >= 3:
-            bias = inputs[2]
-            stmts.append(f"[{output}] = add({mm_out}, {bias});")
-        else:
-            stmts.append(f"[{output}] = identity({mm_out});")
-        return "\n\t".join(stmts)
-
-    def _convert_addmm(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.addmm.default(bias, mat1, mat2) = bias + mat1 @ mat2"""
-        if len(inputs) < 3:
-            return self._convert_identity(node, output, inputs)
-        bias, mat1, mat2 = inputs[0], inputs[1], inputs[2]
-        mm_out = f"operand_{self.operand_counter}"
-        self.operand_counter += 1
-        return "\n\t".join([
-            f"[{mm_out}] = matmul({mat1}, {mat2});",
-            f"[{output}] = add({mm_out}, {bias});",
-        ])
-
-    def _convert_matmul(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.mm / aten.matmul — uses WebNN matmul which supports any batch rank."""
-        if len(inputs) < 2:
-            raise NotImplementedError("matmul requires 2 inputs")
-        a, b = inputs[0], inputs[1]
-        stmts = []
-
-        a_node = node.args[0] if isinstance(node.args[0], fx.Node) else None
-        b_node = node.args[1] if len(node.args) > 1 and isinstance(node.args[1], fx.Node) else None
-        a_shape = self._get_node_shape(a_node) if a_node else self.operand_shapes.get(a, [])
-        b_shape = self._get_node_shape(b_node) if b_node else self.operand_shapes.get(b, [])
-        out_shape = self._get_node_shape(node)
-
-        # Promote 1-D vectors to matrices so the WebNN runtime handles them safely.
-        # The extra dimension is squeezed back out via reshape after matmul.
-        a_was_1d = bool(a_shape) and len(a_shape) == 1
-        b_was_1d = bool(b_shape) and len(b_shape) == 1
-        if a_was_1d:
-            tmp = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            stmts.append(f"[{tmp}] = reshape({a}, newShape=[1, {a_shape[0]}]);")
-            a = tmp
-        if b_was_1d:
-            tmp = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            stmts.append(f"[{tmp}] = reshape({b}, newShape=[{b_shape[0]}, 1]);")
-            b = tmp
-
-        needs_reshape = (a_was_1d or b_was_1d) and bool(out_shape)
-        mm_out = output if not needs_reshape else f"operand_{self.operand_counter}"
-        if needs_reshape:
-            self.operand_counter += 1
-
-        stmts.append(f"[{mm_out}] = matmul({a}, {b});")
-        if needs_reshape:
-            shape_str = ", ".join(str(d) for d in out_shape)
-            stmts.append(f"[{output}] = reshape({mm_out}, newShape=[{shape_str}]);")
-        return "\n\t".join(stmts)
-
-    def _convert_t(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.t — transpose a 2-D matrix."""
-        input_tensor = inputs[0] if inputs else "unknown"
-        return f"[{output}] = transpose({input_tensor}, permutation=[1, 0]);"
-
-    # --- Activations ---
-
-    def _convert_relu(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        return f"[{output}] = clamp({inputs[0] if inputs else 'unknown'}, minValue=0.0);"
-
-    def _convert_sigmoid(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        return f"[{output}] = sigmoid({inputs[0] if inputs else 'unknown'});"
-
-    def _convert_tanh(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        return f"[{output}] = tanh({inputs[0] if inputs else 'unknown'});"
-
-    def _convert_silu(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        x = inputs[0] if inputs else "unknown"
-        sig = f"operand_{self.operand_counter}"
-        self.operand_counter += 1
-        return f"[{sig}] = sigmoid({x});\n\t[{output}] = mul({x}, {sig});"
-
-    def _convert_gelu(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """GELU via tanh approximation: 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))"""
-        x = inputs[0] if inputs else "unknown"
-        c1 = self._create_inline_constant(0.7978845608028654)   # sqrt(2/pi)
-        c2 = self._create_inline_constant(0.044715)
-        c3 = self._create_inline_constant(3.0)
-        c_half = self._create_inline_constant(0.5)
-        c_one = self._create_inline_constant(1.0)
-
-        def tmp():
-            name = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            return name
-
-        x3, inner, scaled, tanh_in, tanh_out, one_plus, half_x, r = (
-            tmp(), tmp(), tmp(), tmp(), tmp(), tmp(), tmp(), output
-        )
-        stmts = [
-            f"[{x3}] = pow({x}, {c3});",
-            f"[{inner}] = mul({x3}, {c2});",
-            f"[{inner}] = add({x}, {inner});",
-            f"[{scaled}] = mul({inner}, {c1});",
-            f"[{tanh_out}] = tanh({scaled});",
-            f"[{one_plus}] = add({tanh_out}, {c_one});",
-            f"[{half_x}] = mul({x}, {c_half});",
-            f"[{r}] = mul({half_x}, {one_plus});",
-        ]
-        return "\n\t".join(stmts)
-
-    def _convert_hardtanh(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        x = inputs[0] if inputs else "unknown"
-        args = node.args
-        min_val = args[1] if len(args) > 1 else 0.0
-        max_val = args[2] if len(args) > 2 else 6.0
-        return f"[{output}] = clamp({x}, minValue={min_val}, maxValue={max_val});"
-
-    def _convert_clamp(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        x = inputs[0] if inputs else "unknown"
-        args = node.args
-        params = []
-        min_val = args[1] if len(args) > 1 else node.kwargs.get("min")
-        max_val = args[2] if len(args) > 2 else node.kwargs.get("max")
-        if min_val is not None:
-            params.append(f"minValue={min_val}")
-        if max_val is not None:
-            params.append(f"maxValue={max_val}")
-        return f"[{output}] = clamp({x}, {', '.join(params)});"
-
-    # --- Normalization ---
-
-    def _convert_batch_norm_aten(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.batch_norm.default(input, weight, bias, running_mean, running_var,
-                                    training, momentum, eps, cudnn_enabled)"""
-        args = node.args
-
-        def get_op(idx):
-            n = args[idx] if len(args) > idx else None
-            return self._get_input_operand(n) if isinstance(n, fx.Node) else None
-
-        input_tensor = get_op(0) or "unknown"
-        weight = get_op(1)       # gamma / scale
-        bias_op = get_op(2)      # beta / bias
-        mean_op = get_op(3)      # running_mean
-        var_op = get_op(4)       # running_var
-        eps = args[7] if len(args) > 7 else 1e-5
-
-        if mean_op and var_op:
-            params = [f"epsilon={eps}", "axis=1"]
-            if weight:
-                params.append(f"scale={weight}")
-            if bias_op:
-                params.append(f"bias={bias_op}")
-            # TODO fix parser to accept mean and variance as named args as well
-            # return f"[{output}] = batchNormalization({input_tensor}, mean={mean_op}, variance={var_op}, {', '.join(params)});"
-            return f"[{output}] = batchNormalization({input_tensor}, {mean_op}, {var_op}, {', '.join(params)});"
-
-        # No running stats — layer-norm style decomposition over NCHW [0,2,3]
-        return self._batch_norm_decompose(input_tensor, weight, bias_op, eps, node, output)
-
-    def _convert_batch_norm_no_training(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten._native_batch_norm_legit_no_training.default(input, weight, bias, running_mean, running_var, momentum, eps)"""
-        args = node.args
-
-        def get_op(idx):
-            n = args[idx] if len(args) > idx else None
-            return self._get_input_operand(n) if isinstance(n, fx.Node) else None
-
-        input_tensor = get_op(0) or "unknown"
-        weight = get_op(1)
-        bias_op = get_op(2)
-        mean_op = get_op(3)
-        var_op = get_op(4)
-        eps = args[6] if len(args) > 6 else 1e-5
-
-        if mean_op and var_op:
-            params = [f"epsilon={eps}", "axis=1"]
-            if weight:
-                params.append(f"scale={weight}")
-            if bias_op:
-                params.append(f"bias={bias_op}")
-            return f"[{output}] = batchNormalization({input_tensor}, {mean_op}, {var_op}, {', '.join(params)});"
-
-        return self._batch_norm_decompose(input_tensor, weight, bias_op, eps, node, output)
-
-    def _batch_norm_decompose(self, input_tensor, weight, bias_op, eps, node, output) -> str:
-        """Decompose batch norm into mean/var/normalize ops for NCHW [0,2,3]."""
-        input_shape = self._get_node_shape(node.args[0]) if node.args and isinstance(node.args[0], fx.Node) else []
-        C = input_shape[1] if len(input_shape) > 1 else 0
-        eps_c = self._create_inline_constant(float(eps))
-
-        def tmp():
-            name = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            return name
-
-        mean_t, centered, sq, var_t, var_eps, std_t, norm_t = (
-            tmp(), tmp(), tmp(), tmp(), tmp(), tmp(), tmp()
-        )
-        steps = [
-            f"[{mean_t}] = reduceMean({input_tensor}, axes=[0, 2, 3], keepDimensions=true);",
-            f"[{centered}] = sub({input_tensor}, {mean_t});",
-            f"[{sq}] = mul({centered}, {centered});",
-            f"[{var_t}] = reduceMean({sq}, axes=[0, 2, 3], keepDimensions=true);",
-            f"[{var_eps}] = add({var_t}, {eps_c});",
-            f"[{std_t}] = sqrt({var_eps});",
-            f"[{norm_t}] = div({centered}, {std_t});",
-        ]
-        result = norm_t
-
-        if weight and C:
-            w_shaped, scaled = tmp(), tmp()
-            steps += [
-                f"[{w_shaped}] = reshape({weight}, newShape=[1, {C}, 1, 1]);",
-                f"[{scaled}] = mul({result}, {w_shaped});",
-            ]
-            result = scaled
-
-        if bias_op and C:
-            b_shaped = tmp()
-            steps += [
-                f"[{b_shaped}] = reshape({bias_op}, newShape=[1, {C}, 1, 1]);",
-                f"[{output}] = add({result}, {b_shaped});",
-            ]
-        else:
-            steps.append(f"[{output}] = identity({result});")
-
-        return "\n\t".join(steps)
-
-    def _convert_layer_norm(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.layer_norm.default(input, normalized_shape, weight, bias, eps)"""
-        x = inputs[0] if inputs else "unknown"
-        args = node.args
-        weight = self._get_input_operand(args[2]) if len(args) > 2 and isinstance(args[2], fx.Node) else None
-        bias_op = self._get_input_operand(args[3]) if len(args) > 3 and isinstance(args[3], fx.Node) else None
-        eps = args[4] if len(args) > 4 else 1e-5
-        params = []
-        if weight:
-            params.append(f"scale={weight}")
-        if bias_op:
-            params.append(f"bias={bias_op}")
-        params.append(f"epsilon={eps}")
-        return f"[{output}] = layerNormalization({x}, {', '.join(params)});"
-
-    def _convert_group_norm(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.group_norm.default(input, num_groups, weight, bias, eps)"""
-        x = inputs[0] if inputs else "unknown"
-        args = node.args
-        num_groups = args[1] if len(args) > 1 else 32
-        weight = self._get_input_operand(args[2]) if len(args) > 2 and isinstance(args[2], fx.Node) else None
-        bias_op = self._get_input_operand(args[3]) if len(args) > 3 and isinstance(args[3], fx.Node) else None
-        eps = args[4] if len(args) > 4 else 1e-5
-        input_shape = self._get_node_shape(args[0]) if args and isinstance(args[0], fx.Node) else []
-
-        if not input_shape or len(input_shape) < 2:
-            params = []
-            if weight:
-                params.append(f"scale={weight}")
-            if bias_op:
-                params.append(f"bias={bias_op}")
-            params.append(f"epsilon={eps}")
-            return f"[{output}] = layerNormalization({x}, {', '.join(params)}); // approx group_norm"
-
-        N, C = input_shape[0], input_shape[1]
-        spatial = input_shape[2:]
-        cpg = C // num_groups
-        eps_c = self._create_inline_constant(float(eps))
-
-        def tmp():
-            name = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            return name
-
-        r1 = tmp()
-        r1_shape = [N, num_groups, cpg] + spatial
-        mean_axes = list(range(2, 2 + 1 + len(spatial)))
-        axes_str = ", ".join(map(str, mean_axes))
-
-        mean_t, centered, sq, var_t, var_eps, std_t, norm_t, r_back = (
-            tmp(), tmp(), tmp(), tmp(), tmp(), tmp(), tmp(), tmp()
-        )
-        orig_str = ", ".join(map(str, input_shape))
-        steps = [
-            f"[{r1}] = reshape({x}, newShape=[{', '.join(map(str, r1_shape))}]);",
-            f"[{mean_t}] = reduceMean({r1}, axes=[{axes_str}], keepDimensions=true);",
-            f"[{centered}] = sub({r1}, {mean_t});",
-            f"[{sq}] = mul({centered}, {centered});",
-            f"[{var_t}] = reduceMean({sq}, axes=[{axes_str}], keepDimensions=true);",
-            f"[{var_eps}] = add({var_t}, {eps_c});",
-            f"[{std_t}] = sqrt({var_eps});",
-            f"[{norm_t}] = div({centered}, {std_t});",
-            f"[{r_back}] = reshape({norm_t}, newShape=[{orig_str}]);",
-        ]
-        result = r_back
-
-        if weight:
-            w_shaped, scaled = tmp(), tmp()
-            w_shape = [1] * len(input_shape)
-            w_shape[1] = self.operand_shapes.get(weight, [C])[0]
-            steps += [
-                f"[{w_shaped}] = reshape({weight}, newShape=[{', '.join(map(str, w_shape))}]);",
-                f"[{scaled}] = mul({result}, {w_shaped});",
-            ]
-            result = scaled
-
-        if bias_op:
-            b_shaped = tmp()
-            b_shape = [1] * len(input_shape)
-            b_shape[1] = self.operand_shapes.get(bias_op, [C])[0]
-            steps += [
-                f"[{b_shaped}] = reshape({bias_op}, newShape=[{', '.join(map(str, b_shape))}]);",
-                f"[{output}] = add({result}, {b_shaped});",
-            ]
-        else:
-            steps.append(f"[{output}] = identity({result});")
-
-        return "\n\t".join(steps)
-
-    # --- Pooling ---
-
-    def _convert_max_pool2d(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.max_pool2d.default / max_pool2d_with_indices.default"""
-        x = inputs[0] if inputs else "unknown"
-        args = node.args
-        kernel = args[1] if len(args) > 1 else node.kwargs.get("kernel_size", [2, 2])
-        stride = args[2] if len(args) > 2 else node.kwargs.get("stride", kernel)
-        padding = args[3] if len(args) > 3 else node.kwargs.get("padding", [0, 0])
-        if not isinstance(kernel, (list, tuple)):
-            kernel = [kernel, kernel]
-        if not isinstance(stride, (list, tuple)):
-            stride = [stride, stride]
-        if not isinstance(padding, (list, tuple)):
-            padding = [padding, padding, padding, padding]
-        elif len(padding) == 2:
-            padding = [padding[0], padding[0], padding[1], padding[1]]
-
-        params = [f"windowDimensions=[{kernel[0]}, {kernel[1]}]"]
-        if stride != [1, 1]:
-            params.append(f"strides=[{stride[0]}, {stride[1]}]")
-        if padding != [0, 0, 0, 0]:
-            params.append(f"padding=[{padding[0]}, {padding[1]}, {padding[2]}, {padding[3]}]")
-
-        # max_pool2d_with_indices returns a tuple; the first element is the pooled tensor.
-        # The FX node itself represents index 0 (values), index 1 (indices) via getitem.
-        return f"[{output}] = maxPool2d({x}, {', '.join(params)});"
-
-    def _convert_avg_pool2d(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        x = inputs[0] if inputs else "unknown"
-        args = node.args
-        kernel = args[1] if len(args) > 1 else [2, 2]
-        stride = args[2] if len(args) > 2 else kernel
-        padding = args[3] if len(args) > 3 else [0, 0]
-        if not isinstance(kernel, (list, tuple)):
-            kernel = [kernel, kernel]
-        if not isinstance(stride, (list, tuple)):
-            stride = [stride, stride]
-        if not isinstance(padding, (list, tuple)):
-            padding = [padding, padding, padding, padding]
-        elif len(padding) == 2:
-            padding = [padding[0], padding[0], padding[1], padding[1]]
-
-        params = [f"windowDimensions=[{kernel[0]}, {kernel[1]}]"]
-        if stride != [1, 1]:
-            params.append(f"strides=[{stride[0]}, {stride[1]}]")
-        if padding != [0, 0, 0, 0]:
-            params.append(f"padding=[{padding[0]}, {padding[1]}, {padding[2]}, {padding[3]}]")
-        return f"[{output}] = averagePool2d({x}, {', '.join(params)});"
-
-    def _convert_global_avg_pool(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        x = inputs[0] if inputs else "unknown"
-        return f"[{output}] = reduceMean({x}, axes=[2, 3], keepDimensions=true);"
-
-    def _convert_reduce_mean(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        x = inputs[0] if inputs else "unknown"
-        args = node.args
-        axes = None
-        keep = True
-        if "dim" in node.kwargs:
-            axes = node.kwargs["dim"]
-        elif len(args) > 1:
-            axes = args[1]
-        if "keepdim" in node.kwargs:
-            keep = node.kwargs["keepdim"]
-        elif len(args) > 2:
-            keep = args[2]
-        if axes is not None:
-            if not isinstance(axes, (list, tuple)):
-                axes = [axes]
-            axes_str = ", ".join(map(str, axes))
-            return f"[{output}] = reduceMean({x}, axes=[{axes_str}], keepDimensions={'true' if keep else 'false'});"
-        return f"[{output}] = reduceMean({x});"
-
-    # --- Arithmetic ---
-
-    def _make_arithmetic(self, op: str, node: fx.Node, output: str, inputs: List[str]) -> str:
-        if len(inputs) == 2:
-            return f"[{output}] = {op}({inputs[0]}, {inputs[1]});"
-        if len(inputs) == 1:
-            # scalar second operand
-            for arg in node.args:
-                if isnumeric(arg) and not isinstance(arg, fx.Node):
-                    const = self._create_inline_constant(arg)
-                    return f"[{output}] = {op}({inputs[0]}, {const});"
-        raise NotImplementedError(f"Invalid {op} operation: inputs={inputs} args={node.args}")
-
-    def _convert_add(self, node, output, inputs):
-        return self._make_arithmetic("add", node, output, inputs)
-
-    def _convert_sub(self, node, output, inputs):
-        return self._make_arithmetic("sub", node, output, inputs)
-
-    def _convert_mul(self, node, output, inputs):
-        return self._make_arithmetic("mul", node, output, inputs)
-
-    def _convert_div(self, node, output, inputs):
-        return self._make_arithmetic("div", node, output, inputs)
-
-    def _convert_neg(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        return f"[{output}] = neg({inputs[0] if inputs else 'unknown'});"
-
-    def _convert_pow(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        if len(inputs) >= 2:
-            return f"[{output}] = pow({inputs[0]}, {inputs[1]});"
-        # Scalar exponent in args
-        x = inputs[0] if inputs else "unknown"
-        exp_val = node.args[1] if len(node.args) > 1 else None
-        if exp_val is not None and not isinstance(exp_val, fx.Node):
-            const = self._create_inline_constant(float(exp_val))
-            return f"[{output}] = pow({x}, {const});"
-        raise NotImplementedError("pow: cannot determine exponent")
-
-    def _convert_pow_scalar(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.pow.Scalar(scalar_base, tensor_exponent) — scalar ** tensor.
-        Decomposed as exp(log(base) * exponent).
-        """
-        base = node.args[0] if node.args else 1.0
-        x = inputs[0] if inputs else "unknown"
-        log_base = math.log(float(base))
-        log_c = self._create_inline_constant(log_base)
-        scaled = f"operand_{self.operand_counter}"
-        self.operand_counter += 1
-        return f"[{scaled}] = mul({x}, {log_c});\n\t[{output}] = exp({scaled});"
-
-    # --- Elementwise math ---
-
-    def _convert_math_sqrt(self, node, output, inputs):
-        return f"[{output}] = sqrt({inputs[0] if inputs else 'unknown'});"
-
-    def _convert_math_exp(self, node, output, inputs):
-        return f"[{output}] = exp({inputs[0] if inputs else 'unknown'});"
-
-    def _convert_math_abs(self, node, output, inputs):
-        return f"[{output}] = abs({inputs[0] if inputs else 'unknown'});"
-
-    def _convert_math_log(self, node, output, inputs):
-        return f"[{output}] = log({inputs[0] if inputs else 'unknown'});"
-
-    def _convert_math_cos(self, node, output, inputs):
-        return f"[{output}] = cos({inputs[0] if inputs else 'unknown'});"
-
-    def _convert_math_sin(self, node, output, inputs):
-        return f"[{output}] = sin({inputs[0] if inputs else 'unknown'});"
-
-    def _convert_rsqrt(self, node, output, inputs):
-        """aten.rsqrt.default(x) = 1 / sqrt(x)"""
-        x = inputs[0] if inputs else "unknown"
-        sqrt_op = f"operand_{self.operand_counter}"
-        self.operand_counter += 1
-        one_c = self._create_inline_constant(1.0)
-        return f"[{sqrt_op}] = sqrt({x});\n\t[{output}] = div({one_c}, {sqrt_op});"
-
-    def _convert_reciprocal(self, node, output, inputs):
-        """aten.reciprocal.default(x) = 1 / x"""
-        x = inputs[0] if inputs else "unknown"
-        one_c = self._create_inline_constant(1.0)
-        return f"[{output}] = div({one_c}, {x});"
-
-    # --- Shape manipulation ---
-
-    def _convert_reshape(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        x = inputs[0] if inputs else "unknown"
-
-        # Prefer static output shape from FX metadata
-        meta_shape = self._get_node_shape(node)
-        if meta_shape:
-            return f"[{output}] = reshape({x}, newShape=[{', '.join(map(str, meta_shape))}]);"
-
-        # aten.flatten.using_ints(input, start_dim, end_dim)
-        if len(node.args) >= 2 and isinstance(node.args[1], int):
-            start_dim = int(node.args[1])
-            end_dim = int(node.args[2]) if len(node.args) > 2 and isinstance(node.args[2], int) else -1
-            if node.args and isinstance(node.args[0], fx.Node):
-                in_shape = self._get_node_shape(node.args[0])
-                if in_shape:
-                    rank = len(in_shape)
-                    if end_dim < 0:
-                        end_dim += rank
-                    if 0 <= start_dim <= end_dim < rank:
-                        flat_dim = math.prod(in_shape[start_dim:end_dim + 1])
-                        new_shape = in_shape[:start_dim] + [int(flat_dim)] + in_shape[end_dim + 1:]
-                        return f"[{output}] = reshape({x}, newShape=[{', '.join(map(str, new_shape))}]);"
-
-        # aten.reshape / aten.view: second arg is the shape list
-        if len(node.args) > 1:
-            new_shape = node.args[1]
-            if isinstance(new_shape, (list, tuple)):
-                return f"[{output}] = reshape({x}, newShape=[{', '.join(map(str, new_shape))}]);"
-
-        raise NotImplementedError(f"Cannot determine reshape target shape for {node}")
-
-    def _convert_permute(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.permute.default(input, dims_list) — dims is a single list arg."""
-        x = inputs[0] if inputs else "unknown"
-        dims = node.args[1] if len(node.args) > 1 else None
-        if isinstance(dims, (list, tuple)):
-            perm_str = ", ".join(map(str, dims))
-            return f"[{output}] = transpose({x}, permutation=[{perm_str}]);"
-        raise NotImplementedError(f"permute: cannot determine dims from {node.args}")
-
-    def _convert_transpose(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.transpose.int(input, dim0, dim1) — swaps two dims."""
-        x = inputs[0] if inputs else "unknown"
-        if len(node.args) >= 3:
-            dim0, dim1 = int(node.args[1]), int(node.args[2])
-            in_shape = self._get_node_shape(node.args[0]) if isinstance(node.args[0], fx.Node) else []
-            rank = len(in_shape)
-            if rank == 0:
-                raise NotImplementedError("transpose: unknown rank")
-            perm = list(range(rank))
-            d0 = dim0 % rank
-            d1 = dim1 % rank
-            perm[d0], perm[d1] = perm[d1], perm[d0]
-            return f"[{output}] = transpose({x}, permutation=[{', '.join(map(str, perm))}]);"
-        return f"[{output}] = transpose({x});"
-
-    def _convert_unsqueeze(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        x = inputs[0] if inputs else "unknown"
-        in_shape = self._get_node_shape(node.args[0]) if isinstance(node.args[0], fx.Node) else []
-        dim = int(node.args[1]) if len(node.args) > 1 else 0
-        rank = len(in_shape)
-        if dim < 0:
-            dim = rank + 1 + dim
-        new_shape = list(in_shape[:dim]) + [1] + list(in_shape[dim:])
-        return f"[{output}] = reshape({x}, newShape=[{', '.join(map(str, new_shape))}]);"
-
-    def _convert_squeeze(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        x = inputs[0] if inputs else "unknown"
-        out_shape = self._get_node_shape(node)
-        if out_shape:
-            return f"[{output}] = reshape({x}, newShape=[{', '.join(map(str, out_shape))}]);"
-        return f"[{output}] = identity({x});"
-
-    def _convert_concat(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        axis = 0
-        if "dim" in node.kwargs:
-            axis = node.kwargs["dim"]
-        elif len(node.args) > 1 and not isinstance(node.args[1], fx.Node):
-            axis = node.args[1]
-        if axis < 0:
-            tensor_list = node.args[0]
-            first_tensor = tensor_list[0] if isinstance(tensor_list, (list, tuple)) else tensor_list
-            ndim = len(self._get_node_shape(first_tensor))
-            if ndim > 0:
-                axis = ndim + axis
-        if inputs:
-            return f"[{output}] = concat([{', '.join(inputs)}], axis={axis});"
-        if len(node.args) >= 1 and isinstance(node.args[0], (list, tuple)):
-            ops = ", ".join(self._get_input_operand(n) for n in node.args[0] if isinstance(n, fx.Node))
-            return f"[{output}] = concat([{ops}], axis={axis});"
-        raise NotImplementedError("concat: no inputs")
-
-    def _convert_stack(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        # dim may be in kwargs or in node.args[1]
-        if "dim" in node.kwargs:
-            dim = node.kwargs["dim"]
-        elif len(node.args) > 1 and isinstance(node.args[1], int):
-            dim = node.args[1]
-        else:
-            dim = 0
-
-        # inputs may be empty when the tensor list is packed as node.args[0]
-        tensors = node.args[0] if isinstance(node.args[0], (list, tuple)) else []
-        tensor_inputs = [self._get_input_operand(n) for n in tensors if isinstance(n, fx.Node)]
-        if not tensor_inputs:
-            tensor_inputs = inputs
-        if not tensor_inputs:
-            raise NotImplementedError("stack: no inputs")
-
-        first = tensors[0] if tensors and isinstance(tensors[0], fx.Node) else None
-        in_shape = self._get_node_shape(first) if first else []
-        steps = []
-        unsqueezed = []
-        for inp in tensor_inputs:
-            us = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            unsqueezed.append(us)
-            if in_shape:
-                pos = dim if dim >= 0 else len(in_shape) + 1 + dim
-                new_shape = list(in_shape[:pos]) + [1] + list(in_shape[pos:])
-                steps.append(f"[{us}] = reshape({inp}, newShape=[{', '.join(map(str, new_shape))}]);")
-            else:
-                steps.append(f"[{us}] = reshape({inp}, newShape=[1]);")
-        concat_dim = dim if dim >= 0 else len(in_shape) + 1 + dim
-        steps.append(f"[{output}] = concat([{', '.join(unsqueezed)}], axis={concat_dim});")
-        return "\n\t".join(steps)
-
-    def _convert_split(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        return self._convert_split_via_slices(node, output, inputs) # TODO native webnn split had some issues
-
-    def _convert_split_via_split_op(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """Original implementation: emits a single WebNN split() op."""
-        x = inputs[0] if inputs else "unknown"
-        sections = node.args[1] if len(node.args) > 1 else None
-        dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", 0)
-        if dim == -1:
-            dim = len(self._get_node_shape(node.args[0])) - 1
-        if isinstance(sections, (list, tuple)):
-            out_ops = []
-            for _ in sections:
-                op = f"operand_{self.operand_counter}"
-                self.operand_counter += 1
-                out_ops.append(op)
-            self.multi_output_operands[node.name] = out_ops
-            return f"[{', '.join(out_ops)}] = split({x}, splits=[{', '.join(map(str, sections))}], axis={dim});"
-        in_shape = self._get_node_shape(node.args[0]) if node.args and isinstance(node.args[0], fx.Node) else []
-        if in_shape and sections is not None:
-            dim_n = int(dim) % len(in_shape)
-            dim_size = in_shape[dim_n]
-            split_size = int(sections)
-            n = dim_size // split_size
-            rem = dim_size % split_size
-            sizes = [split_size] * n
-            if rem:
-                sizes.append(rem)
-            out_ops = []
-            for _ in sizes:
-                op = f"operand_{self.operand_counter}"
-                self.operand_counter += 1
-                out_ops.append(op)
-            self.multi_output_operands[node.name] = out_ops
-            return f"[{', '.join(out_ops)}] = split({x}, splits=[{', '.join(map(str, sizes))}], axis={dim});"
-        return f"[{output}] = split({x}, splits={sections}, axis={dim});"
-
-    def _convert_split_via_slices(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """Alternative implementation: decomposes split into one slice() op per chunk."""
-        x = inputs[0] if inputs else "unknown"
-        sections = node.args[1] if len(node.args) > 1 else None
-        in_shape = self._get_node_shape(node.args[0]) if node.args and isinstance(node.args[0], fx.Node) else []
-        if not in_shape:
-            raise NotImplementedError(f"split via slices: unknown input shape for {node.name}")
-        rank = len(in_shape)
-        dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", 0)
-        dim = int(dim) % rank
-
-        if isinstance(sections, (list, tuple)):
-            sizes = list(sections)
-        elif sections is not None:
-            split_size = int(sections)
-            dim_size = in_shape[dim]
-            n = dim_size // split_size
-            rem = dim_size % split_size
-            sizes = [split_size] * n
-            if rem:
-                sizes.append(rem)
-        else:
-            raise NotImplementedError(f"split via slices: cannot determine sizes for {node.name}")
-
-        steps = []
-        out_ops = []
-        offset = 0
-        for s in sizes:
-            op = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            out_ops.append(op)
-            starts = [0] * rank
-            slice_sizes = list(in_shape)
-            starts[dim] = offset
-            slice_sizes[dim] = s
-            steps.append(
-                f"[{op}] = slice({x}, starts=[{', '.join(map(str, starts))}], "
-                f"sizes=[{', '.join(map(str, slice_sizes))}]);"
-            )
-            offset += s
-
-        self.multi_output_operands[node.name] = out_ops
-        self.node_to_operand[node.name] = out_ops[0]
-        return "\n\t".join(steps)
-
-    def _convert_chunk(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.chunk.default(tensor, chunks, dim) — decompose into slice ops per chunk."""
-        x = inputs[0] if inputs else "unknown"
-        n_chunks = int(node.args[1]) if len(node.args) > 1 else 1
-        dim = int(node.args[2]) if len(node.args) > 2 else 0
-        in_shape = self._get_node_shape(node.args[0]) if node.args and isinstance(node.args[0], fx.Node) else []
-        if not in_shape:
-            raise NotImplementedError(f"chunk: unknown input shape for {node.name}")
-        rank = len(in_shape)
-        dim = dim % rank
-        dim_size = in_shape[dim]
-        # Compute actual chunk sizes (last chunk may be smaller)
-        base = (dim_size + n_chunks - 1) // n_chunks
-        sizes = []
-        remaining = dim_size
-        for _ in range(n_chunks):
-            s = min(base, remaining)
-            if s <= 0:
-                break
-            sizes.append(s)
-            remaining -= s
-        actual_n = len(sizes)
-        steps = []
-        out_ops = []
-        offset = 0
-        for s in sizes:
-            op = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            out_ops.append(op)
-            starts = [0] * rank
-            slice_sizes = list(in_shape)
-            starts[dim] = offset
-            slice_sizes[dim] = s
-            steps.append(
-                f"[{op}] = slice({x}, starts=[{', '.join(map(str, starts))}], "
-                f"sizes=[{', '.join(map(str, slice_sizes))}]);"
-            )
-            offset += s
-        self.multi_output_operands[node.name] = out_ops
-        # Register the first output as this node's primary operand (satisfies downstream identity)
-        self.node_to_operand[node.name] = out_ops[0]
-        return "\n\t".join(steps)
-
-    def _convert_unbind(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.unbind.int(tensor, dim) — split into individual tensors along dim."""
-        x = inputs[0] if inputs else "unknown"
-        dim = int(node.args[1]) if len(node.args) > 1 else 0
-        in_shape = self._get_node_shape(node.args[0]) if node.args and isinstance(node.args[0], fx.Node) else []
-        if not in_shape:
-            raise NotImplementedError(f"unbind: unknown input shape for {node.name}")
-        rank = len(in_shape)
-        dim = dim % rank
-        dim_size = in_shape[dim]
-        out_shape = list(in_shape[:dim]) + list(in_shape[dim + 1:])
-        steps = []
-        out_ops = []
-        for i in range(dim_size):
-            slice_op = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            squeeze_op = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            starts = [0] * rank
-            sizes = list(in_shape)
-            starts[dim] = i
-            sizes[dim] = 1
-            steps.append(
-                f"[{slice_op}] = slice({x}, starts=[{', '.join(map(str, starts))}], "
-                f"sizes=[{', '.join(map(str, sizes))}]);"
-            )
-            steps.append(
-                f"[{squeeze_op}] = reshape({slice_op}, newShape=[{', '.join(map(str, out_shape))}]);"
-            )
-            out_ops.append(squeeze_op)
-        self.multi_output_operands[node.name] = out_ops
-        self.node_to_operand[node.name] = out_ops[0]
-        return "\n\t".join(steps)
-
-    def _convert_getitem(self, node: fx.Node, output: str, inputs: List[str]) -> Optional[str]:
-        """operator.getitem — index into multi-output results (chunk/unbind/split)."""
-        source = node.args[0] if node.args and isinstance(node.args[0], fx.Node) else None
-        idx = node.args[1] if len(node.args) > 1 else 0
-        if source is not None and source.name in self.multi_output_operands:
-            operands = self.multi_output_operands[source.name]
-            if isinstance(idx, int) and 0 <= idx < len(operands):
-                # Alias this node to the pre-computed slice operand (no new op needed)
-                self.node_to_operand[node.name] = operands[idx]
-                return None
-        # Fallback: treat as identity of the source
-        if inputs:
-            return f"[{output}] = identity({inputs[0]});"
-        raise NotImplementedError(f"getitem: cannot resolve index {idx} for {node.name}")
-
-    def _convert_select(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.select.int(tensor, dim, index) — select one slice along dim, removing it."""
-        x = inputs[0] if inputs else "unknown"
-        dim = int(node.args[1]) if len(node.args) > 1 else 0
-        index = int(node.args[2]) if len(node.args) > 2 else 0
-        in_shape = self._get_node_shape(node.args[0]) if node.args and isinstance(node.args[0], fx.Node) else []
-        if not in_shape:
-            raise NotImplementedError(f"select: unknown input shape for {node.name}")
-        rank = len(in_shape)
-        dim = dim % rank
-        if index < 0:
-            index = in_shape[dim] + index
-        starts = [0] * rank
-        sizes = list(in_shape)
-        starts[dim] = index
-        sizes[dim] = 1
-        out_shape = list(in_shape[:dim]) + list(in_shape[dim + 1:])
-        slice_op = f"operand_{self.operand_counter}"
-        self.operand_counter += 1
-        return (
-            f"[{slice_op}] = slice({x}, starts=[{', '.join(map(str, starts))}], "
-            f"sizes=[{', '.join(map(str, sizes))}]);\n"
-            f"\t[{output}] = reshape({slice_op}, newShape=[{', '.join(map(str, out_shape))}]);"
+        if isinstance(padding, str):
+            raise NotImplementedError("String convolution padding is unsupported")
+
+        def pair(v):
+            return list(v) if isinstance(v, (tuple, list)) else [v, v]
+
+        stride, padding, dilation = pair(stride), pair(padding), pair(dilation)
+        return self._emit(
+            "conv2d",
+            lambda t, w: F.conv2d(
+                t,
+                w,
+                bias.tensor if bias is not None else None,
+                stride,
+                padding,
+                dilation,
+                groups,
+            ),
+            x,
+            weight,
+            bias=bias,
+            strides=stride,
+            pads=[padding[0]] * 2 + [padding[1]] * 2,
+            dilations=dilation,
+            groups=groups,
+            input_layout="nchw",
+            filter_layout="oihw",
         )
 
-    def _convert_einsum(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.einsum.default(equation, operands) — decompose common patterns."""
-        equation = node.args[0] if node.args else ""
-        tensors_arg = node.args[1] if len(node.args) > 1 and isinstance(node.args[1], (list, tuple)) else []
-        operands = [self._get_input_operand(n) for n in tensors_arg if isinstance(n, fx.Node)]
+    def _shape(self, node, args, kwargs):
+        name = str(node.target).split(".")[1]
+        x = args[0]
+        if name in (
+            "reshape",
+            "view",
+            "_unsafe_view",
+            "flatten",
+            "unsqueeze",
+            "squeeze",
+        ):
+            # ATen meta execution handles inferred dimensions and no-op squeeze.
+            expected = node.target(x.tensor, *args[1:], **kwargs)
+            return self._reshape(x, expected.shape)
+        if name == "t":
+            return self._transpose(x, list(reversed(range(x.tensor.ndim))))
+        if name == "permute":
+            return self._transpose(x, args[1])
+        if name == "transpose":
+            perm = list(range(x.tensor.ndim))
+            a, b = args[1] % len(perm), args[2] % len(perm)
+            perm[a], perm[b] = perm[b], perm[a]
+            return self._transpose(x, perm)
+        if name in ("cat", "stack"):
+            tensors = x
+            dim = (args[1] if len(args) > 1 else 0) % (
+                tensors[0].tensor.ndim + (name == "stack")
+            )
+            if name == "stack":
+                tensors = [
+                    self._reshape(
+                        t, list(t.tensor.shape[:dim]) + [1] + list(t.tensor.shape[dim:])
+                    )
+                    for t in tensors
+                ]
+            return self._emit(
+                "concat", lambda ts: torch.cat(ts, dim=dim), tensors, axis=dim
+            )
+        if name in ("expand", "expand_as"):
+            shape = args[1].tensor.shape if name == "expand_as" else args[1]
+            resolved = list(x.tensor.expand(shape).shape)
+            return self._emit(
+                "expand", lambda t: t.expand(shape), x, new_shape=resolved
+            )
+        if name in ("split", "split_with_sizes", "chunk", "unbind"):
+            results = node.target(x.tensor, *args[1:], **kwargs)
+            dim = (
+                args[1]
+                if name == "unbind" and len(args) > 1
+                else args[2]
+                if name != "unbind" and len(args) > 2
+                else 0
+            ) % x.tensor.ndim
+            offset, outputs = 0, []
+            for value in results:
+                size = 1 if name == "unbind" else value.shape[dim]
+                part = self._slice(x, dim, offset, offset + size)
+                outputs.append(
+                    self._reshape(part, value.shape) if name == "unbind" else part
+                )
+                offset += size
+            return tuple(outputs)
+        if name == "select":
+            dim, index = args[1] % x.tensor.ndim, args[2]
+            index %= x.tensor.shape[dim]
+            out = self._slice(x, dim, index, index + 1)
+            return self._reshape(out, x.tensor.select(dim, index).shape)
+        if name == "slice":
+            dim = args[1] if len(args) > 1 else 0
+            start = args[2] if len(args) > 2 else 0
+            end = args[3] if len(args) > 3 else x.tensor.shape[dim]
+            step = args[4] if len(args) > 4 else 1
+            return self._slice(x, dim, start, end, step)
+        if name == "einsum":
+            equation, operands = args[:2]
+            if equation != "...n,d->...nd":
+                raise NotImplementedError(f"Unsupported einsum equation: {equation}")
+            a, b = operands
+            a = self._reshape(a, [*a.tensor.shape, 1])
+            return self._binary("mul", a, b)
+        raise NotImplementedError(f"Unsupported shape operation: {node.target}")
 
-        # Pattern: '...n,d->...nd'  (broadcast outer product: [...,n] x [d] -> [...,n,d])
-        if equation == "...n,d->...nd" and len(operands) == 2:
-            a, b = operands[0], operands[1]
-            a_node = tensors_arg[0] if tensors_arg and isinstance(tensors_arg[0], fx.Node) else None
-            b_node = tensors_arg[1] if len(tensors_arg) > 1 and isinstance(tensors_arg[1], fx.Node) else None
-            a_shape = self._get_node_shape(a_node) if a_node else []
-            out_shape = self._get_node_shape(node)
-            if not out_shape:
-                raise NotImplementedError(f"einsum '{equation}': cannot determine output shape")
-            rank_out = len(out_shape)
+    def _slice(self, x, dim, start, end, step=1):
+        dim %= x.tensor.ndim
+        if step <= 0:
+            raise NotImplementedError("Slice strides must be positive")
+        start, end, step = slice(start, end, step).indices(x.tensor.shape[dim])
+        slices = [slice(None)] * x.tensor.ndim
+        slices[dim] = slice(start, end, step)
+        starts, sizes, strides = (
+            [0] * x.tensor.ndim,
+            list(x.tensor.shape),
+            [1] * x.tensor.ndim,
+        )
+        starts[dim], sizes[dim], strides[dim] = start, end - start, step
+        return self._emit(
+            "slice",
+            lambda t: t[tuple(slices)],
+            x,
+            starts=starts,
+            sizes=sizes,
+            strides=strides,
+        )
 
-            def tmp():
-                name = f"operand_{self.operand_counter}"
-                self.operand_counter += 1
-                return name
+    def _normalization(self, node, args, kwargs):
+        name = str(node.target).split(".")[1]
+        x = args[0]
+        if name == "layer_norm":
+            normalized = args[1]
+            weight = args[2] if len(args) > 2 else None
+            bias = args[3] if len(args) > 3 else None
+            eps = args[4] if len(args) > 4 else 1e-5
+            axes = list(range(x.tensor.ndim - len(normalized), x.tensor.ndim))
+            return self._affine(self._normalize(x, axes, eps), weight, bias)
+        if name == "group_norm":
+            groups = args[1]
+            weight = args[2] if len(args) > 2 else None
+            bias = args[3] if len(args) > 3 else None
+            eps = args[4] if len(args) > 4 else 1e-5
+            shape = list(x.tensor.shape)
+            grouped = self._reshape(x, [shape[0], groups, -1])
+            out = self._reshape(self._normalize(grouped, [2], eps), shape)
+            return self._affine(
+                out, weight, bias, [1, shape[1]] + [1] * (len(shape) - 2)
+            )
+        weight, bias, mean, variance = args[1:5]
+        native = name == "_native_batch_norm_legit_no_training"
+        training = False if native else args[5]
+        eps = args[6] if native else args[7]
+        affine_shape = [1, x.tensor.shape[1]] + [1] * (x.tensor.ndim - 2)
+        if not training and mean is not None and variance is not None:
+            mean, variance = (
+                self._reshape(mean, affine_shape),
+                self._reshape(variance, affine_shape),
+            )
+            std = self._emit("sqrt", torch.sqrt, self._binary("add", variance, eps))
+            out = self._binary("div", self._binary("sub", x, mean), std)
+        else:
+            out = self._normalize(x, [0] + list(range(2, x.tensor.ndim)), eps)
+        out = self._affine(out, weight, bias, affine_shape)
+        if native:
+            # Saved statistics in inference mode are empty tensors; WebNN does not
+            # represent zero-sized operands. Reject attempts to consume these.
+            return (out, None, None)
+        return out
 
-            # Unsqueeze a along last axis: [..., n] → [..., n, 1]
-            a_us = tmp()
-            a_us_shape = list(a_shape) + [1]
-            # Reshape b to [1, ..., 1, d] matching output rank
-            b_node_shape = self._get_node_shape(b_node) if b_node else []
-            d = b_node_shape[0] if b_node_shape else out_shape[-1]
-            b_rs = tmp()
-            b_rs_shape = [1] * (rank_out - 1) + [d]
-            return "\n\t".join([
-                f"[{a_us}] = reshape({a}, newShape=[{', '.join(map(str, a_us_shape))}]);",
-                f"[{b_rs}] = reshape({b}, newShape=[{', '.join(map(str, b_rs_shape))}]);",
-                f"[{output}] = mul({a_us}, {b_rs});",
-            ])
+    def _pool(self, node, args, kwargs):
+        name = str(node.target).split(".")[1]
+        x = args[0]
+        if name == "mean":
+            axes = args[1] if len(args) > 1 else None
+            keep = args[2] if len(args) > 2 else kwargs.get("keepdim", False)
+            dtype = kwargs.get("dtype", x.tensor.dtype)
+            return self._mean(self._cast(x, dtype), axes, keep)
+        if name == "adaptive_avg_pool2d":
+            size = args[1]
+            if list(size) != [1, 1]:
+                raise NotImplementedError(
+                    "Adaptive average pooling currently supports output size (1, 1)"
+                )
+            return self._mean(x, [2, 3])
+        kernel = args[1]
 
-        raise NotImplementedError(f"einsum: unsupported equation '{equation}'")
+        def pair(v):
+            return list(v) if isinstance(v, (tuple, list)) else [v, v]
 
-    def _convert_slice(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.slice.Tensor(input, dim, start, end, step)
-        start / end can be None (meaning 0 / full dimension respectively).
-        end can also be 9223372036854775807 (sys.maxsize) meaning full dimension.
-        """
-        x = inputs[0] if inputs else "unknown"
-        args = node.args
-        dim = int(args[1]) if len(args) > 1 else 0
-        start = args[2] if len(args) > 2 else None
-        end = args[3] if len(args) > 3 else None
-        step = int(args[4]) if len(args) > 4 and args[4] is not None else 1
-        in_shape = self._get_node_shape(args[0]) if args and isinstance(args[0], fx.Node) else []
-
-        if not in_shape:
-            return f"// slice: unknown input shape for {node.name}"
-
-        rank = len(in_shape)
-        dim = dim % rank
-        dim_size = in_shape[dim]
-
-        # Resolve None / sentinel values
-        start = 0 if start is None else int(start)
-        end = dim_size if (end is None or end >= sys.maxsize) else min(int(end), dim_size)
-
-        # Handle negative indices
-        if start < 0:
-            start = max(0, dim_size + start)
-        if end < 0:
-            end = max(0, dim_size + end)
-
-        size = max(0, (end - start + step - 1) // step)  # ceiling div for step > 1
-
-        # If the slice covers the full dimension it's a no-op
-        if start == 0 and size == dim_size and step == 1:
-            return f"[{output}] = identity({x});"
-
-        starts = [0] * rank
-        sizes = list(in_shape)
-        starts[dim] = start
-        sizes[dim] = size
-        return f"[{output}] = slice({x}, starts=[{', '.join(map(str, starts))}], sizes=[{', '.join(map(str, sizes))}]);"
-
-    def _convert_expand(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        x = inputs[0] if inputs else "unknown"
-        shape = node.args[1] if len(node.args) > 1 else None
-        if shape and isinstance(shape, (list, tuple)):
-            return f"[{output}] = expand({x}, newShape=[{', '.join(map(str, shape))}]);"
-        return f"// expand: unknown shape for {node.name}"
-
-    def _convert_expand_as(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        x = inputs[0] if inputs else "unknown"
-        target_node = node.args[1] if len(node.args) > 1 and isinstance(node.args[1], fx.Node) else None
-        shape = self._get_node_shape(target_node) if target_node else []
-        if shape:
-            return f"[{output}] = expand({x}, newShape=[{', '.join(map(str, shape))}]);"
-        return f"[{output}] = identity({x}); // expand_as: unknown target shape"
-
-    def _flatten_pad_ints(self, padding) -> Optional[List[int]]:
-        """Coerce PyTorch padding (list/tuple/tensor of ints) to a flat int list, or None if not static."""
-        if padding is None:
-            return []
-        if isinstance(padding, torch.Tensor):
-            try:
-                return [int(x) for x in padding.detach().cpu().reshape(-1).tolist()]
-            except (TypeError, ValueError, RuntimeError):
-                return None
-        if isinstance(padding, (list, tuple)):
-            out: List[int] = []
-            for x in padding:
-                try:
-                    if isinstance(x, torch.Tensor) and x.numel() == 1:
-                        out.append(int(x.item()))
-                    else:
-                        out.append(int(x))
-                except (TypeError, ValueError):
-                    return None
+        kernel = pair(kernel)
+        stride = pair(args[2]) if len(args) > 2 and args[2] else kernel
+        padding = pair(args[3]) if len(args) > 3 else [0, 0]
+        options = dict(
+            window_dimensions=kernel,
+            strides=stride,
+            pads=[padding[0]] * 2 + [padding[1]] * 2,
+            layout="nchw",
+        )
+        if name.startswith("max_pool"):
+            dilation = pair(args[4]) if len(args) > 4 else [1, 1]
+            ceil = args[5] if len(args) > 5 else False
+            out = self._emit(
+                "max_pool2d",
+                lambda t: F.max_pool2d(t, kernel, stride, padding, dilation, ceil),
+                x,
+                dilations=dilation,
+                output_shape_rounding="ceil" if ceil else "floor",
+                **options,
+            )
+            if name == "max_pool2d_with_indices":
+                return (out, None)
             return out
-        return None
-
-    def _pytorch_flat_pad_to_webnn(
-        self, padding_flat: List[int], rank: int
-    ) -> Optional[Tuple[List[int], List[int]]]:
-        """PyTorch F.pad / constant_pad_nd: pairs apply from last dimension backward → WebNN per-axis begin/end."""
-        if rank <= 0 or len(padding_flat) % 2 != 0:
-            return None
-        num_pairs = len(padding_flat) // 2
-        if num_pairs > rank:
-            return None
-        beginning = [0] * rank
-        ending = [0] * rank
-        for i in range(num_pairs):
-            d = rank - 1 - i
-            beginning[d] = int(padding_flat[2 * i])
-            ending[d] = int(padding_flat[2 * i + 1])
-        return beginning, ending
-
-    def _webnn_pad_mode(self, torch_mode: str) -> str:
-        m = (torch_mode or "constant").strip().lower()
-        if m in ("replicate", "replicated"):
-            return "edge"
-        if m in ("reflect", "reflection"):
-            return "reflection"
-        if m in ("constant", "edge"):
-            return m
-        return "constant"
-
-    def _format_pad_scalar(self, value) -> str:
-        try:
-            if isinstance(value, torch.Tensor) and value.numel() == 1:
-                value = value.item()
-            v = float(value)
-            if math.isfinite(v) and v == int(v) and abs(v) <= 2**53:
-                return str(int(v))
-            return repr(v)
-        except (TypeError, ValueError, RuntimeError):
-            return "0"
-
-    def _convert_pad(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.constant_pad_nd / aten.pad → WebNN pad(input, beginningPadding, endingPadding, options)."""
-        x = inputs[0] if inputs else "unknown"
-        args = node.args
-        target_str = str(node.target)
-
-        raw_pad = args[1] if len(args) > 1 else None
-        padding_flat = self._flatten_pad_ints(raw_pad)
-        if padding_flat is None:
-            return f"// pad: non-static padding for {node.name}"
-
-        in_node = args[0] if args and isinstance(args[0], fx.Node) else None
-        in_shape = self._get_node_shape(in_node) if in_node else []
-        rank = len(in_shape) if in_shape else 0
-        if rank == 0 and in_node is not None:
-            rank = len(self._get_node_shape(node))
-        if rank == 0:
-            rank = len(padding_flat) // 2
-
-        mapped = self._pytorch_flat_pad_to_webnn(padding_flat, rank)
-        if mapped is None:
-            return f"// pad: invalid padding length {len(padding_flat)} for rank {rank} ({node.name})"
-        beginning, ending = mapped
-
-        if "constant_pad_nd" in target_str:
-            mode = "constant"
-            value = args[2] if len(args) > 2 else node.kwargs.get("value", 0)
-        else:
-            mode = args[2] if len(args) > 2 and isinstance(args[2], str) else node.kwargs.get("mode", "constant")
-            if not isinstance(mode, str):
-                mode = node.kwargs.get("mode", "constant")
-                if not isinstance(mode, str):
-                    mode = "constant"
-            value = args[3] if len(args) > 3 else node.kwargs.get("value", 0)
-
-        webnn_mode = self._webnn_pad_mode(mode)
-        beg_str = ", ".join(map(str, beginning))
-        end_str = ", ".join(map(str, ending))
-
-        if webnn_mode == "constant":
-            value_str = self._format_pad_scalar(value)
-            return (
-                f'[{output}] = pad({x}, beginningPadding=[{beg_str}], '
-                f'endingPadding=[{end_str}], mode="constant", value={value_str});'
+        ceil = args[4] if len(args) > 4 else False
+        include_pad = args[5] if len(args) > 5 else True
+        divisor = args[6] if len(args) > 6 else None
+        if divisor is not None or (include_pad and any(padding)):
+            raise NotImplementedError(
+                "Average pooling with a custom divisor or included padding is unsupported"
             )
-        return (
-            f'[{output}] = pad({x}, beginningPadding=[{beg_str}], '
-            f'endingPadding=[{end_str}], mode="{webnn_mode}");'
+        return self._emit(
+            "average_pool2d",
+            lambda t: F.avg_pool2d(t, kernel, stride, padding, ceil, include_pad),
+            x,
+            output_shape_rounding="ceil" if ceil else "floor",
+            **options,
         )
 
-    # --- Upsampling ---
+    def _pad(self, node, args, kwargs):
+        x, padding = args[:2]
+        mode = (
+            args[2]
+            if len(args) > 2 and str(node.target).split(".")[1] == "pad"
+            else "constant"
+        )
+        value = (
+            (args[3] if len(args) > 3 else 0)
+            if mode != "constant" or str(node.target).split(".")[1] == "pad"
+            else (args[2] if len(args) > 2 else 0)
+        )
+        value = 0 if value is None else value
+        if mode != "constant" or any(v < 0 for v in padding):
+            raise NotImplementedError("Only nonnegative constant padding is supported")
+        before, after = [0] * x.tensor.ndim, [0] * x.tensor.ndim
+        for i in range(len(padding) // 2):
+            before[-1 - i], after[-1 - i] = padding[2 * i : 2 * i + 2]
+        return self._emit(
+            "pad",
+            lambda t: F.pad(t, padding, mode, value),
+            x,
+            padding=before + after,
+            mode=mode,
+            value=value,
+        )
 
-    def _convert_upsample_nearest2d(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.upsample_nearest2d.vec(input, output_size, scale_factors)
-           aten.upsample_nearest2d.default(input, output_size, scales_h, scales_w)
-        """
-        x = inputs[0] if inputs else "unknown"
-        args = node.args
-        target_str = str(node.target)
-
-        if "vec" in target_str:
-            output_size  = args[1] if len(args) > 1 else None  # int[] or None
-            scale_factors = args[2] if len(args) > 2 else None  # float[] or None
-            if scale_factors:
-                scales_str = ", ".join(str(s) for s in scale_factors)
-                return f'[{output}] = resample2d({x}, mode="nearest-neighbor", scales=[{scales_str}]);'
-            if output_size:
-                sizes_str = ", ".join(str(s) for s in output_size)
-                return f'[{output}] = resample2d({x}, mode="nearest-neighbor", sizes=[{sizes_str}]);'
+    def _upsample(self, node, args, kwargs):
+        x = args[0]
+        bilinear = "bilinear" in str(node.target)
+        if bilinear and args[2]:
+            raise NotImplementedError("Bilinear align_corners=True is unsupported")
+        vec = str(node.target).endswith(".vec")
+        if vec:
+            scales = (
+                args[3 if bilinear else 2]
+                if len(args) > (3 if bilinear else 2)
+                else None
+            )
         else:
-            # .default(input, output_size, scales_h=None, scales_w=None)
-            output_size = args[1] if len(args) > 1 else None
-            scales_h = args[2] if len(args) > 2 else None
-            scales_w = args[3] if len(args) > 3 else None
-            if scales_h is not None and scales_w is not None:
-                return f'[{output}] = resample2d({x}, mode="nearest-neighbor", scales=[{scales_h}, {scales_w}]);'
-            if output_size:
-                sizes_str = ", ".join(str(s) for s in output_size)
-                return f'[{output}] = resample2d({x}, mode="nearest-neighbor", sizes=[{sizes_str}]);'
+            scale_args = args[3 if bilinear else 2 :]
+            scales = (
+                list(scale_args)
+                if scale_args and all(s is not None for s in scale_args)
+                else None
+            )
+        if scales is not None and any(float(scale) != int(scale) for scale in scales):
+            # pywebnn's scale-based resample inference can round dimensions up
+            # where ATen truncates. Fixed index tensors preserve ATen coordinates.
+            for axis, scale, size in zip([2, 3], scales, node.meta["val"].shape[-2:]):
+                x = self._resample_axis(x, axis, float(scale), int(size), bilinear)
+            return x
+        options = (
+            {"scales": list(scales)} if scales is not None else {"sizes": list(args[1])}
+        )
+        return self._emit(
+            "resample2d",
+            lambda t: node.target(t, *args[1:], **kwargs),
+            x,
+            axes=[2, 3],
+            mode="linear" if bilinear else "nearest-neighbor",
+            **options,
+        )
 
-        raise NotImplementedError(f"upsample_nearest2d: need output_size or scale_factors, got args={args}")
+    def _resample_axis(self, x, axis, scale, size, linear):
+        length = x.tensor.shape[axis]
+        positions = torch.arange(size, dtype=torch.float64) / scale
+        if linear:
+            positions = (
+                (torch.arange(size, dtype=torch.float64) + 0.5) / scale - 0.5
+            ).clamp(min=0)
+        lower = positions.floor().to(torch.int32)
 
-    def _convert_upsample_bilinear2d(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.upsample_bilinear2d.vec / .default → resample2d with mode="linear" """
-        x = inputs[0] if inputs else "unknown"
-        args = node.args
-        target_str = str(node.target)
+        def gather(indices):
+            indices = self._constant(indices.clamp(0, length - 1))
+            return self._emit(
+                "gather",
+                lambda t, idx: torch.index_select(t, axis, idx),
+                x,
+                indices,
+                axis=axis,
+            )
 
-        if "vec" in target_str:
-            output_size   = args[1] if len(args) > 1 else None
-            scale_factors = args[3] if len(args) > 3 else None  # arg[2] is align_corners
-            if scale_factors:
-                scales_str = ", ".join(str(s) for s in scale_factors)
-                return f'[{output}] = resample2d({x}, mode="linear", scales=[{scales_str}]);'
-            if output_size:
-                sizes_str = ", ".join(str(s) for s in output_size)
-                return f'[{output}] = resample2d({x}, mode="linear", sizes=[{sizes_str}]);'
-        else:
-            output_size = args[1] if len(args) > 1 else None
-            scales_h = args[3] if len(args) > 3 else None  # arg[2] is align_corners
-            scales_w = args[4] if len(args) > 4 else None
-            if scales_h is not None and scales_w is not None:
-                return f'[{output}] = resample2d({x}, mode="linear", scales=[{scales_h}, {scales_w}]);'
-            if output_size:
-                sizes_str = ", ".join(str(s) for s in output_size)
-                return f'[{output}] = resample2d({x}, mode="linear", sizes=[{sizes_str}]);'
+        low = gather(lower)
+        if not linear:
+            return low
+        high = gather(lower + 1)
+        weights = (positions - lower).to(x.tensor.dtype)
+        shape = [1] * x.tensor.ndim
+        shape[axis] = size
+        weights = self._constant(weights.reshape(shape))
+        return self._binary(
+            "add", low, self._binary("mul", self._binary("sub", high, low), weights)
+        )
 
-        raise NotImplementedError(f"upsample_bilinear2d: need output_size or scale_factors, got args={args}")
+    def _attention(self, node, args, kwargs):
+        name = str(node.target).split(".")[1]
+        if name in ("softmax", "_softmax"):
+            x, axis = args[:2]
+            if name == "_softmax" and len(args) > 2 and args[2]:
+                x = self._cast(x, torch.float32)
+            if "dtype" in kwargs:
+                x = self._cast(x, kwargs["dtype"])
+            axis %= x.tensor.ndim
+            return self._emit("softmax", lambda t: torch.softmax(t, axis), x, axis=axis)
+        q, k, v = args[:3]
+        mask = args[3] if len(args) > 3 else None
+        dropout = args[4] if len(args) > 4 else 0
+        causal = args[5] if len(args) > 5 else False
+        if dropout or kwargs.get("enable_gqa", False):
+            raise NotImplementedError(
+                "Attention dropout and grouped query attention are unsupported"
+            )
+        perm = list(range(k.tensor.ndim))
+        perm[-2], perm[-1] = perm[-1], perm[-2]
+        scores = self._matmul(q, self._transpose(k, perm))
+        scale = kwargs.get("scale")
+        scores = self._binary(
+            "mul",
+            scores,
+            scale if scale is not None else 1 / math.sqrt(q.tensor.shape[-1]),
+        )
+        if causal:
+            if mask is not None:
+                raise NotImplementedError(
+                    "Causal attention with an explicit mask is unsupported"
+                )
+            bias = torch.zeros(
+                (q.tensor.shape[-2], k.tensor.shape[-2]), dtype=q.tensor.dtype
+            )
+            bias.masked_fill_(
+                ~torch.ones_like(bias, dtype=torch.bool).tril(), float("-inf")
+            )
+            scores = self._binary("add", scores, self._constant(bias))
+        if mask is not None:
+            scores = self._binary("add", scores, mask)
+        probabilities = self._emit(
+            "softmax",
+            lambda t: torch.softmax(t, -1),
+            scores,
+            axis=scores.tensor.ndim - 1,
+        )
+        return self._matmul(probabilities, v)
 
-    # --- Softmax / attention ---
+    def _constant_op(self, node, args, kwargs):
+        # All arguments are fixed scalar dimensions; evaluate without model inputs.
+        options = {**kwargs, "device": "cpu"}
+        if any(isinstance(x, CheckedOperand) for x in _pytree.tree_leaves(args)):
+            raise NotImplementedError(
+                f"Data-dependent constant generation: {node.target}"
+            )
+        return self._constant(node.target(*args, **options))
 
-    def _convert_softmax(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.softmax.int(input, dim, half_to_float)"""
-        x = inputs[0] if inputs else "unknown"
-        axis = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", -1)
-        if axis == -1:
-            axis = len(self._get_node_shape(node.args[0])) - 1
-        return f"[{output}] = softmax({x}, axis={axis});"
+    def _identity(self, node, args, kwargs):
+        if "dropout" in str(node.target) and len(args) > 2 and args[2] and args[1] != 0:
+            raise NotImplementedError("Training dropout is unsupported")
+        if "_assert_tensor_metadata" in str(node.target):
+            return None
+        return self._emit("identity", lambda t: t, args[0])
 
-    def _convert_softmax_aten(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten._softmax.default(input, dim, half_to_float)"""
-        return self._convert_softmax(node, output, inputs)
+    def _type(self, node, args, kwargs):
+        x = args[0]
+        value = node.meta["val"]
+        return self._cast(x, value.dtype)
 
-    def _convert_scaled_dot_product_attention(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        if len(inputs) < 3:
-            raise NotImplementedError("SDPA requires Q, K, V inputs")
-        Q, K, V = inputs[0], inputs[1], inputs[2]
-        q_shape = self._get_node_shape(node.args[0]) if isinstance(node.args[0], fx.Node) else []
-        head_dim = q_shape[-1] if q_shape else 64
-        scale = 1.0 / math.sqrt(head_dim)
-        scale_c = self._create_inline_constant(scale)
-
-        def tmp():
-            name = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-            return name
-
-        k_shape = self._get_node_shape(node.args[1]) if len(node.args) > 1 and isinstance(node.args[1], fx.Node) else []
-        if k_shape and len(k_shape) >= 2:
-            perm = list(range(len(k_shape)))
-            perm[-2], perm[-1] = perm[-1], perm[-2]
-        else:
-            perm = [0, 1, 3, 2]
-        perm_str = ", ".join(map(str, perm))
-
-        kt, qk, qk_sc, attn_w = tmp(), tmp(), tmp(), tmp()
-        axis = len(q_shape) - 1
-        return "\n\t".join([
-            f"[{kt}] = transpose({K}, permutation=[{perm_str}]);",
-            f"[{qk}] = matmul({Q}, {kt});",
-            f"[{qk_sc}] = mul({qk}, {scale_c});",
-            f"[{attn_w}] = softmax({qk_sc}, axis={axis});",
-            f"[{output}] = matmul({attn_w}, {V});",
-        ])
-
-    # --- Compile-time constant generation ---
-
-    def _convert_arange(self, node: fx.Node, output: str, inputs: List[str]) -> Optional[str]:
-        """aten.arange.* — evaluate at export time, embed as @bytes(...) constant.
-
-        Overload args:
-          arange.default(end)
-          arange.start(start, end)
-          arange.start_step(start, end, step)
-        dtype / device come in via kwargs.
-        """
-        args = node.args
-        target_str = str(node.target)
-        if "start_step" in target_str:
-            start, end, step = args[0], args[1], args[2]
-        elif "start" in target_str:
-            start, end = args[0], args[1]
-            step = node.kwargs.get("step", 1)
-        else:
-            start, end, step = 0, args[0], 1
-
-        dtype = node.kwargs.get("dtype", torch.float32) or torch.float32
-        values = torch.arange(start, end, step, dtype=dtype)
-
-        const_name = f"const_arange_{self.operand_counter}"
-        self.operand_counter += 1
-        self.inline_constants[const_name] = values
-        self.operand_shapes[const_name] = list(values.shape)
-        # Override so downstream ops reference the constant operand
-        self.node_to_operand[node.name] = const_name
-        return None  # no entry emitted in nodes {}
-
-    def _convert_full(self, node: fx.Node, output: str, inputs: List[str]) -> Optional[str]:
-        """aten.full.default(size, fill_value, *, dtype) — bake into @bytes."""
-        args = node.args
-        size = list(args[0]) if args else []
-        fill_value = args[1] if len(args) > 1 else 0
-        dtype = node.kwargs.get("dtype", torch.float32) or torch.float32
-        values = torch.full(size, fill_value, dtype=dtype)
-        const_name = f"const_full_{self.operand_counter}"
-        self.operand_counter += 1
-        self.inline_constants[const_name] = values
-        self.operand_shapes[const_name] = list(values.shape)
-        self.node_to_operand[node.name] = const_name
-        return None
-
-    def _convert_full_zeros(self, node: fx.Node, output: str, inputs: List[str]) -> Optional[str]:
-        """aten.zeros.default — bake into @bytes."""
-        size = list(node.args[0]) if node.args else []
-        dtype = node.kwargs.get("dtype", torch.float32) or torch.float32
-        values = torch.zeros(size, dtype=dtype)
-        const_name = f"const_zeros_{self.operand_counter}"
-        self.operand_counter += 1
-        self.inline_constants[const_name] = values
-        self.operand_shapes[const_name] = list(values.shape)
-        self.node_to_operand[node.name] = const_name
-        return None
-
-    def _convert_full_ones(self, node: fx.Node, output: str, inputs: List[str]) -> Optional[str]:
-        """aten.ones.default — bake into @bytes."""
-        size = list(node.args[0]) if node.args else []
-        dtype = node.kwargs.get("dtype", torch.float32) or torch.float32
-        values = torch.ones(size, dtype=dtype)
-        const_name = f"const_ones_{self.operand_counter}"
-        self.operand_counter += 1
-        self.inline_constants[const_name] = values
-        self.operand_shapes[const_name] = list(values.shape)
-        self.node_to_operand[node.name] = const_name
-        return None
-
-    # --- No-ops / cast ---
-
-    def _convert_identity(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        if inputs:
-            return f"[{output}] = identity({inputs[0]});"
-        raise NotImplementedError("identity: no input")
-
-    def _emit_cast(self, node: fx.Node, output: str, inputs: List[str], target_dtype: torch.dtype) -> str:
-        """Emit cast or identity depending on whether the WebNN dtype actually changes."""
-        x = inputs[0] if inputs else "unknown"
-        input_node = node.args[0] if node.args and isinstance(node.args[0], fx.Node) else None
-        src_dtype = self._get_node_dtype(input_node) if input_node else torch.float32
-        src = self._get_webnn_dtype(src_dtype)
-        tgt = self._get_webnn_dtype(target_dtype)
-        if src == tgt:
-            return f"[{output}] = identity({x});"
-        return f"[{output}] = cast({x}, type={tgt});"
-
-    def _convert_cast(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten._to_copy.default / aten.to.dtype — dtype in args[1] or kwargs['dtype']."""
-        x = inputs[0] if inputs else "unknown"
-        # aten.to.dtype: args = (input, dtype, ...)
-        # aten._to_copy: dtype lives in kwargs
-        target_dtype = None
-        if len(node.args) > 1 and isinstance(node.args[1], torch.dtype):
-            target_dtype = node.args[1]
-        if target_dtype is None:
-            target_dtype = node.kwargs.get("dtype")
-        if not isinstance(target_dtype, torch.dtype):
-            return f"[{output}] = identity({x});"
-        return self._emit_cast(node, output, inputs, target_dtype)
-
-    def _convert_to_device(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.to.device(input, device, dtype, ...) — ignore device, cast dtype."""
-        x = inputs[0] if inputs else "unknown"
-        # args = (input, device, dtype, non_blocking, copy, memory_format)
-        target_dtype = node.args[2] if len(node.args) > 2 else None
-        if not isinstance(target_dtype, torch.dtype):
-            return f"[{output}] = identity({x});"
-        return self._emit_cast(node, output, inputs, target_dtype)
-
-    def _convert_type_as(self, node: fx.Node, output: str, inputs: List[str]) -> str:
-        """aten.type_as.default(input, other) — cast input to dtype of other."""
-        x = inputs[0] if inputs else "unknown"
-        other_node = node.args[1] if len(node.args) > 1 and isinstance(node.args[1], fx.Node) else None
-        if other_node is None:
-            return f"[{output}] = identity({x});"
-        target_dtype = self._get_node_dtype(other_node)
-        return self._emit_cast(node, output, inputs, target_dtype)
-
-    # ------------------------------------------------------------------
-    # Output extraction
-    # ------------------------------------------------------------------
-
-    def _extract_outputs(self, gm: fx.GraphModule) -> str:
-        outputs = []
-        for node in gm.graph.nodes:
-            if node.op == "output":
-                flat = node.args[0]
-                if isinstance(flat, (list, tuple)):
-                    for arg in flat:
-                        if isinstance(arg, fx.Node):
-                            outputs.append(self._get_input_operand(arg))
-                elif isinstance(flat, fx.Node):
-                    outputs.append(self._get_input_operand(flat))
-        return "; ".join(outputs) + ";" if outputs else ""
-
-    # ------------------------------------------------------------------
-    # Inline constant helpers
-    # ------------------------------------------------------------------
-
-    def _create_inline_constant(self, value) -> str:
-        for name, v in self.inline_constants.items():
-            if type(v) is type(value):
-                if isinstance(value, torch.Tensor) and isinstance(v, torch.Tensor):
-                    if torch.allclose(value, v):
-                        return name
-                elif v == value:
-                    return name
-        name = f"const_scalar_{self.operand_counter}"
-        self.operand_counter += 1
-        self.inline_constants[name] = value
-        return name
-
-    def _extract_inline_constants(self) -> str:
-        consts = []
-        for name, value in self.inline_constants.items():
-            if isinstance(value, torch.Tensor):
-                dtype = self._get_webnn_dtype(value.dtype)
-                shape = list(value.shape)
-                raw = value.cpu().numpy().tobytes()
-                byte_list = ", ".join(str(b) for b in raw)
-                consts.append(f"\t{name}: {dtype}[{', '.join(map(str, shape))}] @bytes([{byte_list}]);")
-            elif isinstance(value, float):
-                consts.append(f"\t{name}: f32[] @scalar({value});")
-            elif isinstance(value, int):
-                consts.append(f"\t{name}: i32[] @scalar({value});")
-            else:
-                consts.append(f"\t{name}: f32[] @scalar({value});")
-        return "\n".join(consts) + "\n" if consts else ""
-
-    # ------------------------------------------------------------------
-    # Operand name management
-    # ------------------------------------------------------------------
-
-    def _get_operand_name(self, node: fx.Node) -> str:
-        if node.name not in self.node_to_operand:
-            self.node_to_operand[node.name] = f"operand_{self.operand_counter}"
-            self.operand_counter += 1
-        return self.node_to_operand[node.name]
-
-    def _get_input_operand(self, node) -> str:
-        if isinstance(node, fx.Node):
-            # Parameter / buffer placeholder → look up in weight_operands by node name
-            if node.op == "placeholder" and node.name in self.weight_operands:
-                return self.weight_operands[node.name]
-            if node.name in self.node_to_operand:
-                return self.node_to_operand[node.name]
-            return self._get_operand_name(node)
-        return str(node)
-
-    # ------------------------------------------------------------------
-    # Shape / dtype helpers
-    # ------------------------------------------------------------------
-
-    def _get_node_shape(self, node) -> List[int]:
-        if node is None or not hasattr(node, "meta"):
-            return []
-        meta = node.meta
-        val = meta.get("val")
-        if val is not None and hasattr(val, "shape"):
-            return [int(d) for d in val.shape]
-        tm = meta.get("tensor_meta")
-        if tm is not None and hasattr(tm, "shape"):
-            return [int(d) for d in tm.shape]
-        return []
-
-    def _get_node_dtype(self, node) -> torch.dtype:
-        if not hasattr(node, "meta"):
-            return torch.float32
-        meta = node.meta
-        val = meta.get("val")
-        if val is not None and hasattr(val, "dtype"):
-            return val.dtype
-        tm = meta.get("tensor_meta")
-        if tm is not None and hasattr(tm, "dtype"):
-            return tm.dtype
-        return torch.float32
-
-    def _get_webnn_dtype(self, dtype) -> str:
-        if not isinstance(dtype, torch.dtype):
-            return "f32"
-        return {
-            torch.float32: "f32",
-            torch.float16: "f16",
-            torch.bfloat16: "f32",  # cast down to f32
-            torch.int32: "i32",
-            torch.int64: "i64",
-            torch.int8: "i8",
-            torch.uint8: "u8",
-        }.get(dtype, "f32")
+    def _getitem(self, node, args, kwargs):
+        value = operator.getitem(*args)
+        if value is None:
+            raise NotImplementedError(
+                f"Unused auxiliary output is consumed at {node.name}"
+            )
+        return value
