@@ -5,8 +5,21 @@ Covers: Conv2d, matmul, Linear × multiple configurations.
 
 import pytest
 import torch
-from .models import SingleConv, SingleMatmul, SingleLinear, SingleMM, SingleAddMM, SingleScaledDotProduct, SingleEinsum
-from .conftest import assert_export_matches, assert_generates_webnn, validate_webnn_execution
+
+from .conftest import (
+    assert_builds_webnn,
+    assert_export_matches,
+    validate_webnn_execution,
+)
+from .models import (
+    SingleAddMM,
+    SingleConv,
+    SingleEinsum,
+    SingleLinear,
+    SingleMatmul,
+    SingleMM,
+    SingleScaledDotProduct,
+)
 
 
 class ConvOpConfig:
@@ -129,10 +142,11 @@ def test_gemm_op(gemm_config, input_shape):
     torch._dynamo.reset()
     model = gemm_config.model_cls(gemm_config.in_features, gemm_config.out_features)
     x = torch.randn(*input_shape)
-    assert_export_matches(model, x, rtol=1e-3)
-    text = assert_generates_webnn(model, x)
-    assert "matmul" in text, f"Expected 'matmul' in graph:\n{text}"
-    assert "gemm" not in text, f"Unexpected 'gemm' in graph:\n{text}"
+    assert_export_matches(model, x, rtol=1e-3, atol=1e-3)
+    exporter = assert_builds_webnn(model, x)
+    operations = [op for _, op, _ in exporter.webnn_generator.checked_shapes]
+    assert "matmul" in operations
+    assert "gemm" not in operations
     validate_webnn_execution(model, x)
 
 

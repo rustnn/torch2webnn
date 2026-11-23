@@ -2,7 +2,9 @@
 
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
+
+from .conftest import assert_export_matches, validate_webnn_execution
 from .models import (
     ConcatModel,
     NormalizationOpsModel,
@@ -12,8 +14,6 @@ from .models import (
     ReductionOpsModel,
     ShapeOpsModel,
 )
-from .conftest import assert_export_matches, validate_webnn_execution
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

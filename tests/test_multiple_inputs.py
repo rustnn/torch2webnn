@@ -1,10 +1,9 @@
 """Test exporting models with multiple inputs"""
 
-import pytest
 import torch
-import torch.nn as nn
-from .models import MultiInputModel
+
 from .conftest import assert_export_matches, validate_webnn_execution
+from .models import MultiInputModel
 
 
 def test_multiple_inputs():

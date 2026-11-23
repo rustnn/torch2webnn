@@ -1,12 +1,10 @@
 """Test arange constant generation during model export"""
 
-import os
-import tempfile
 import pytest
 import torch
-from webnn_torch_export import export_model_with_weights
-from .models import ArangeModel
+
 from .conftest import assert_export_matches, validate_webnn_execution
+from .models import ArangeModel
 
 
 @pytest.fixture

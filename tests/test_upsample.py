@@ -2,10 +2,10 @@
 
 import pytest
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from .conftest import assert_export_matches, validate_webnn_execution
+from torch import nn
 
+from .conftest import assert_export_matches, validate_webnn_execution
 
 # ---------------------------------------------------------------------------
 # Parametrize over (id, scale_or_size kwarg, mode)

@@ -5,9 +5,9 @@ Covers: BatchNorm2d with and without running mean/var.
 
 import pytest
 import torch
-from .models import SingleBatchNorm2d, SingleBatchNorm2dNoRunning
-from .conftest import assert_export_matches, validate_webnn_execution
 
+from .conftest import assert_export_matches, validate_webnn_execution
+from .models import SingleBatchNorm2d, SingleBatchNorm2dNoRunning
 
 BATCH_NORM_CONFIGS = [
     (16, (1, 16, 8, 8)),

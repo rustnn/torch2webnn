@@ -4,10 +4,9 @@ Import from this module rather than defining models inline in test files.
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-
+from torch import nn
 
 # ---------------------------------------------------------------------------
 # Single-op wrappers (used in test_single_ops.py)

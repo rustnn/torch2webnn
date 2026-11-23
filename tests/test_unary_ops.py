@@ -6,8 +6,9 @@ Covers: exp, abs, sqrt, log, sigmoid, tanh, relu, rsqrt, reciprocal,
 
 import pytest
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
+
 from .conftest import assert_export_matches, validate_webnn_execution
 
 

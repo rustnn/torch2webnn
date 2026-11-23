@@ -9,10 +9,8 @@ common to pre-compute and cache the text embeddings rather than running the
 encoder at inference time, so exporting it is optional.
 """
 
-import os
 import torch
-from webnn_torch_export import export_model_with_weights
-from _common import hf_login, OUTPUT_DIR
+from _common import hf_login
 
 
 def main():

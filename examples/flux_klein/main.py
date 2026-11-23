@@ -10,8 +10,6 @@ Runs all export scripts in sequence. You can also run each script individually:
     python export_autoencoder.py --mode decoder   # decoder only (txt2img)
 """
 
-import export_text_encoder
-import export_flow
 import export_autoencoder
 
 if __name__ == "__main__":

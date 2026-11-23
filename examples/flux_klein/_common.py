@@ -1,7 +1,6 @@
 """Shared setup for Flux Klein export scripts."""
 
 import os
-import torch
 
 OUTPUT_DIR = os.path.dirname(__file__)
 
