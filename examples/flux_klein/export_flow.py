@@ -11,7 +11,7 @@ import torch
 from _common import OUTPUT_DIR, hf_login
 from flux2.util import load_flow_model
 
-from webnn_torch_export import export_model_with_weights
+from torch2webnn import export_model_with_weights
 
 
 def main():

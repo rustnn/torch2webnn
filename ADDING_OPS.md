@@ -1,7 +1,7 @@
 # Adding ATen operations
 
 `torch.export.export` produces ATen `call_function` nodes. The dispatch table in
-`webnn_torch_export/webnn_op_mappings.py` maps `str(node.target)` to a method on
+`torch2webnn/webnn_op_mappings.py` maps `str(node.target)` to a method on
 `WebNNGraphGenerator`. Unsupported targets fail immediately.
 
 Add the target to `ATEN_OP_TABLE` and implement its converter. Converters receive

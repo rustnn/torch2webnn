@@ -1,4 +1,4 @@
-# WebNN PyTorch Exporter
+# torch2webnn
 
 Build and execute fixed-size WebNN networks directly with `pywebnn` from
 `torch.export` ATen graphs.
@@ -21,7 +21,7 @@ inference, the selected runtime must be available to the dynamic loader. For ONN
 
 ```python
 import torch
-from webnn_torch_export import export_model
+from torch2webnn import export_model
 
 model = torch.nn.Sequential(torch.nn.Linear(10, 20), torch.nn.ReLU()).eval()
 x = torch.randn(2, 10)
