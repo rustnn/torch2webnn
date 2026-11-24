@@ -38,7 +38,7 @@ jobs:
       - name: Run tests
         run: |
           pytest tests/ -v --tb=short -m "not slow" \
-            --cov=webnn_torch_export \
+            --cov=torch2webnn \
             --cov-report=term-missing \
             --cov-report=xml 
             

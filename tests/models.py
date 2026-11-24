@@ -1,5 +1,5 @@
 """
-Reusable nn.Module definitions for webnn_torch_export tests.
+Reusable nn.Module definitions for torch2webnn tests.
 Import from this module rather than defining models inline in test files.
 """
 

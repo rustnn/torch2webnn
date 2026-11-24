@@ -1,1 +1,1 @@
-"""Tests for webnn_torch_export"""
+"""Tests for torch2webnn"""

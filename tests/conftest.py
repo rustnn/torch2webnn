@@ -12,7 +12,7 @@ def seed():
 
 
 def assert_export_matches(model, example_input, rtol=1e-5, atol=1e-5, debug=False):
-    from webnn_torch_export import export_model
+    from torch2webnn import export_model
 
     model.eval()
     inputs = example_input if isinstance(example_input, tuple) else (example_input,)
@@ -30,7 +30,7 @@ def assert_export_matches(model, example_input, rtol=1e-5, atol=1e-5, debug=Fals
 
 
 def assert_builds_webnn(model, example_input, debug=False):
-    from webnn_torch_export import export_model
+    from torch2webnn import export_model
 
     model.eval()
     exporter, _ = export_model(model, example_input, debug=debug)

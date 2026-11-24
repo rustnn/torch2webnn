@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 import webnn
 
-from webnn_torch_export import (
+from torch2webnn import (
     CustomExporter,
     ShapeMismatchError,
     export_model,
@@ -193,7 +193,7 @@ def test_noninteger_resize_scale(mode):
 
 
 def test_cli_builds_saved_program(tmp_path, monkeypatch):
-    from webnn_torch_export.exporter import main
+    from torch2webnn.exporter import main
 
     ep = torch.export.export(torch.nn.ReLU(), (torch.randn(2, 3),))
     source, destination = tmp_path / "program.pt2", tmp_path / "model.webnn"
